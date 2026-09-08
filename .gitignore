@@ -1,0 +1,8 @@
+Prisma-Setup.exe
+
+node_modules/
+.env
+.env.teste
+data/
+downloads/
+.vscode/

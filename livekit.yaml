@@ -1,0 +1,66 @@
+# Config do livekit-server pra produção (VM na nuvem), usado pelo
+# docker-compose.yml deste diretório. Esse arquivo é lido diretamente
+# pelo binário do livekit-server (--config) — ele não faz substituição
+# de ${VARS}, então os valores aqui são literais. Se a API key/secret
+# mudar, atualizar em .env (LIVEKIT_API_KEY/LIVEKIT_API_SECRET) também.
+#
+# Ingress+Redis voltaram (2026-08-30, ver docker-compose.yml) — a versão
+# Electron usa o pipeline GStreamer/WHIP, que precisa dos dois.
+
+port: 5880
+
+# tcp_port/port_range_* IGUAIS à porta externa do docker-compose.yml, de
+# propósito (2026-08-31, bug real encontrado em produção) — essas portas
+# vão dentro do payload ICE que o LiveKit manda pro cliente (GStreamer/
+# livekit-client), então o processo PRECISA achar que já está na porta
+# externa "de verdade": se o Docker remapeia (interna != externa), o
+# LiveKit anuncia a porta INTERNA (que ele conhece) pro cliente, que tenta
+# conectar nela por fora e trava pra sempre em "ICE checking" (o ingress
+# acaba caindo com "source encoder not ready"). Só a porta HTTP/WS de
+# sinalização (`port` acima, 7880) é segura pra remapear — o cliente disca
+# ela direto por uma URL que a gente controla (LIVEKIT_WS_URL), não é
+# anunciada dentro de nenhum protocolo.
+rtc:
+  tcp_port: 5881
+  port_range_start: 60000
+  port_range_end: 60100
+  # Essencial pra clientes fora da LAN (amigos pela internet) conseguirem
+  # negociar ICE — sem isso o LiveKit anuncia o IP interno do
+  # container/VM, que não é alcançável de fora.
+  use_external_ip: true
+
+keys:
+  # Mesma API key/secret do token-server (.env: LIVEKIT_API_KEY/
+  # LIVEKIT_API_SECRET) — ATENÇÃO: os dois precisam ser literalmente
+  # iguais (esse arquivo não lê o .env, os valores são copiados à mão).
+  homelab: 3gr6fwz5lqnnQMTfe1QYKb7456UkcHALBfhzjpUNOiHzMcwb6j1G3zMIPA8ejOC3
+
+redis:
+  # Nome do serviço no docker-compose.yml (rede bridge padrão do Compose
+  # tem DNS interno resolvendo nomes de serviço) — necessário pro
+  # livekit-server conversar com o livekit-ingress via RPC (psrpc).
+  address: redis:6379
+
+# Endereço público (não o IP interno do container) — é o que o
+# CreateIngress (chamado pelo token-server) devolve como 'url' do WHIP
+# pro GStreamer do host publicar. Sem isso, o 'url' vem vazio/errado.
+# Porta 5080 (não a 8080 "de fábrica") — esse servidor roda em paralelo
+# com o antigo na mesma VM, ver comentário no topo do docker-compose.yml
+# sobre o esquema de portas. Atualizar se o IP da VM mudar (mesmo valor
+# de HOST no .env e node_ip no docker-compose.yml).
+ingress:
+  whip_base_url: http://143.20.0.54:5080/w
+
+webhook:
+  api_key: homelab
+  # Nome do serviço no docker-compose.yml (rede bridge padrão do Compose
+  # tem DNS interno resolvendo nomes de serviço) — prisma_server está na
+  # mesma rede, não precisa saltar pelo IP público. Porta 5000 (não a
+  # 3000 "de fábrica") — 2026-08-31: o usuário igualou porta interna e
+  # externa do prisma_server também (.env PORT=5000, docker-compose.yml
+  # "5000:5000"), então essa URL interna precisa apontar pra 5000 agora
+  # (real bug encontrado em produção: webhook nunca chegava, LiveKit
+  # tentava porta 3000 e dava connection refused, já que o Express
+  # dentro do container escuta em 5000).
+  urls:
+    - http://prisma_server:5000/webhook

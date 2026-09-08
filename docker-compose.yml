@@ -1,0 +1,176 @@
+# Stack de produção (VM na nuvem) do servidor do **Prisma** (pasta
+# prisma_server, serviço `prisma_server` abaixo) — Redis, LiveKit Server,
+# LiveKit Ingress e o próprio prisma_server, tudo em Docker, em rede bridge
+# (padrão do Compose) com todas as portas necessárias publicadas
+# explicitamente abaixo.
+#
+# Clonado em 2026-09-08 do servidor do TaOnPlay
+# (D:\MY PROJECTS\_nodeServer\token_api) mantendo **os mesmos IPs e as mesmas
+# portas**, por pedido explícito. Consequência prática: as duas stacks NÃO
+# rodam ao mesmo tempo na mesma VM — o segundo `docker compose up` falha no
+# bind de todas as portas abaixo. Antes de subir esta, ou derruba a do
+# token_api, ou desloca as portas daqui (respeitando a regra do ICE
+# explicada mais abaixo: as de MÍDIA precisam ser iguais dentro e fora do
+# container), ou usa outra VM. Ver item 4 do ROADMAP.md do Prisma.
+#
+# Ingress+Redis voltaram (2026-08-30) — a versão Electron migrou a
+# captura de tela pro pipeline GStreamer/WHIP (ver MEMORIA.md do
+# Electron), que precisa dos dois de novo, igual o app Flutter antigo
+# (ver D:\MY PROJECTS\node\token-server\docker-compose.yml, usado como
+# referência pra completar este arquivo).
+#
+# Portas do LADO DE FORA (host) deslocadas de propósito (2026-08-31) —
+# essa stack roda em PARALELO com o servidor antigo na MESMA VM (pra
+# testar sem derrubar o que já está no ar): todo mundo +2000 em cima da
+# porta "de fábrica" de cada serviço.
+#
+# EXCEÇÃO IMPORTANTE (bug real encontrado em produção, 2026-08-31): as
+# portas de MÍDIA/ICE (rtc.tcp_port, rtc.port_range_*, ingress udp_port)
+# NÃO PODEM ser remapeadas (interno != externo) — o LiveKit/Ingress
+# anuncia a porta que ELE PRÓPRIO conhece (a interna) dentro do payload
+# ICE que manda pro cliente (GStreamer/livekit-client); se o Docker
+# remapeia por fora, o cliente tenta conectar na porta interna errada e o
+# ICE trava pra sempre em "checking" (sintoma: sem erro nenhum na hora de
+# iniciar a live, mas o ingress cai pouco depois com "source encoder not
+# ready", e a sala nunca aparece pro viewer porque a publicação nunca
+# completa de verdade). Por isso essas 3 (tcp_port do LiveKit, o range de
+# mídia do LiveKit, e o udp_port do Ingress) usam a MESMA porta dentro e
+# fora — só as portas puramente HTTP/WS (sinalização do LiveKit, endpoint
+# WHIP do Ingress, RTMP) são seguras pra deslocar, porque a URL/porta é
+# sempre passada explicitamente (LIVEKIT_WS_URL, whip_base_url em
+# livekit.yaml) em vez de embutida num protocolo.
+#
+# Resumo do que cada porta virou (fábrica → externa) — 2026-08-31: o
+# usuário pediu pra igualar TODAS (interna = externa em tudo, não só nas
+# 3 que precisam por causa do ICE), então as que eram só remapeadas por
+# fora (sinalização, WHIP HTTP, RTMP) tiveram a porta INTERNA também
+# trocada pra bater (livekit.yaml `port:`, `ws_url`/`whip_port`/
+# `rtmp_port` do Ingress abaixo, e `LIVEKIT_SERVER_URL` no .env) — sem
+# isso, `prisma_server`/`livekit-ingress` (que falam com o `livekit-server`
+# DIRETO pela rede interna do Docker, sem passar pelo mapeamento do
+# host) tentam a porta errada e dá ECONNREFUSED / "Não foi possível
+# criar o ingress".
+#   3000→5000 (prisma_server — interna TAMBÉM virou 5000, em .env PORT=
+#              5000 e no webhook.urls do livekit.yaml, que fala com o
+#              prisma_server pela rede interna do Docker)
+#   7880→5880 (sinalização LiveKit — interna TAMBÉM virou 5880, em
+#              livekit.yaml `port:` e no `LIVEKIT_SERVER_URL`/`ws_url`
+#              usados pelas chamadas internas)
+#   7881→5881 (ICE-TCP fallback do LiveKit — NÃO É SEGURO remapear, ver
+#              acima; por isso interna TAMBÉM virou 5881 em livekit.yaml)
+#   8080→5080 (endpoint HTTP do WHIP — interna TAMBÉM virou 5080, em
+#              `whip_port` do Ingress abaixo)
+#   7885→5885 (mídia UDP do WHIP — NÃO É SEGURO remapear; interna também
+#              virou 5885 na config do Ingress abaixo)
+#   1935→5935 (RTMP, não usado — interna também virou 5935 por
+#              consistência, em `rtmp_port` do Ingress abaixo)
+#   50000-50100→60000-60100 (mídia UDP do LiveKit — NÃO É SEGURO
+#              remapear; o range interno também virou 60000-60100 em
+#              livekit.yaml)
+#
+# Por que bridge + `ports:` em vez de `network_mode: host`: com host
+# networking o Docker NÃO abre nada no firewall do próprio Linux (só o
+# `ports:` do Docker faz esse furo automático via iptables) — então mesmo
+# com o firewall/grupo de segurança da VM liberado, o firewall interno do
+# host podia continuar bloqueando. Com `ports:`, o Docker cuida da parte
+# do host sozinho; falta só liberar essas mesmas portas no firewall/grupo
+# de segurança da VM (lista abaixo) e, se houver NAT/roteador na frente,
+# fazer o port-forward delas também.
+#
+# Uso:
+#   cd prisma_server
+#   docker compose up -d --build
+#
+# As variáveis (HOST, PORT, LIVEKIT_*, TOKEN_API_SECRET) vêm do .env
+# desse mesmo diretório — o Docker Compose carrega automaticamente um
+# arquivo ".env" ao lado deste arquivo.
+#
+# Portas que precisam estar abertas no firewall/grupo de segurança da VM
+# (e no roteador, se a VM estiver atrás de NAT) — já com o deslocamento
+# acima:
+#   - 5000/tcp        — o prisma_server (ajuste se mudar PORT no .env;
+#                        PORT em si continua 3000, é só o mapeamento
+#                        externo que virou 5000)
+#   - 5880/tcp        — sinalização do LiveKit (WebSocket)
+#   - 5881/tcp        — ICE/TURN fallback (TCP) do LiveKit
+#   - 60000-60100/udp — mídia (RTP/ICE) do LiveKit — ajuste o range aqui
+#                        se precisar de mais participantes simultâneos
+#   - 5080/tcp        — endpoint HTTP do WHIP (ingress) — é pra onde o
+#                        GStreamer do host publica a transmissão
+#   - 5885/udp        — mídia (RTP/ICE) do WHIP (ingress)
+#   - 5935/tcp        — RTMP (só se um dia usar RTMP em vez de WHIP; pode
+#                        deixar fechado enquanto só usar WHIP)
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5379:6379"
+
+  livekit-server:
+    image: livekit/livekit-server:latest
+    restart: unless-stopped
+    ports:
+      - "5880:5880/tcp"
+      - "5881:5881/tcp"
+      - "60000-60100:60000-60100/udp"
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    command: ["--config", "/etc/livekit.yaml"]
+    depends_on:
+      - redis
+
+  livekit-ingress:
+    image: livekit/ingress:latest
+    restart: unless-stopped
+    ports:
+      - "5080:5080/tcp"
+      - "5885:5885/udp"
+      - "5935:5935/tcp"
+    depends_on:
+      - redis
+      - livekit-server
+    environment:
+      INGRESS_CONFIG_BODY: |
+        api_key: ${LIVEKIT_API_KEY}
+        api_secret: ${LIVEKIT_API_SECRET}
+        ws_url: ws://livekit-server:5880
+        redis:
+          address: redis:6379
+        rtmp_port: 5935
+        whip_port: 5080
+        rtc_config:
+          udp_port: 5885
+          # Em rede bridge a auto-detecção pega o IP interno do Docker em
+          # vez do IP público real — sem isso o 'url' que o CreateIngress
+          # devolve pro WHIP vem vazio/errado. Atualizar se o IP da VM
+          # mudar (ver também HOST no .env e node_ip aqui precisam bater).
+          node_ip: ${HOST}
+        logging:
+          level: info
+
+  prisma_server:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "5000:5000/tcp"
+    # ./data guarda userList.json (cadastro/login) — bind mount de propósito:
+    # server.js é copiado pra DENTRO da imagem a cada build (`build: .`
+    # acima), então qualquer coisa gravada só no filesystem da imagem se
+    # perderia no próximo `docker compose up -d --build`. Sem isso, toda
+    # atualização do servidor apagaria os usuários cadastrados.
+    #
+    # ./downloads e ./version.json (auto-atualização do app, ver
+    # RELEASE.md do Electron): também bind mount, de propósito — publicar
+    # uma versão nova do app é só trocar o .exe em downloads/ e atualizar
+    # version.json, sem precisar rebuildar/reiniciar este container.
+    volumes:
+      - ./data:/app/data
+      - ./downloads:/app/downloads
+      - ./version.json:/app/version.json
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - livekit-server
