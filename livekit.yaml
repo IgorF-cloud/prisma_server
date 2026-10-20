@@ -29,6 +29,30 @@ rtc:
   # container/VM, que não é alcançável de fora.
   use_external_ip: true
 
+# QUEM CRIA SALA É O prisma_server (2026-09-29) — o histórico inteiro
+# está no comentário do `ensureRoom`, no server.js.
+#
+# `auto_create: false` é a linha que fecha a porta das "salas fantasma".
+# Com ele ligado (o padrão), QUALQUER cliente com um token ainda válido
+# materializava a sala só de conectar — inclusive muito depois de o host
+# ter encerrado a live. Era assim que a sala reaparecia na lista logo
+# depois de o host parar, agora sem host: o livekit-client de um viewer
+# que estivesse no meio de uma reconexão refazia o join e a ressuscitava.
+#
+# ⚠️ NÃO mexer aqui sem o `createRoom` do lado do prisma_server (rota
+# POST /ingress): com `auto_create: false` e ninguém criando a sala,
+# NENHUMA live sobe — nem o Ingress entra numa sala que não existe. As
+# duas metades são uma mudança só.
+#
+# Os dois timeouts repetem o que o `createRoom` passa por sala; aqui eles
+# valem como padrão pra quem não passar nada. O empty_timeout de fábrica
+# são 300s — 5 minutos de sala vazia de pé quando uma live nem chega a
+# subir.
+room:
+  auto_create: false
+  empty_timeout: 60
+  departure_timeout: 20
+
 keys:
   # Mesma API key/secret do token-server (.env: LIVEKIT_API_KEY/
   # LIVEKIT_API_SECRET) — ATENÇÃO: os dois precisam ser literalmente

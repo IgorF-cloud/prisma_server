@@ -1,0 +1,27 @@
+[Unit]
+Description=Roda o build do compose do Prisma
+Documentation=file:/opt/prisma/ops/README.md
+# Sem o Docker no ar não há o que fazer.
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/prisma/ops/deploy.sh
+
+# O build sobe imagem, baixa camada e reinicia container: 10 minutos é
+# folga pro pior caso. Sem teto, um build travado ficaria segurando a
+# trava pra sempre e nenhum outro deploy sairia.
+TimeoutStartSec=600
+
+# O script já escreve tudo em ops/logs/<id>.log; isto aqui é a segunda
+# via, pra quando nem o arquivo existir (erro antes de começar):
+#   journalctl -u prisma-deploy.service -n 50
+StandardOutput=journal
+StandardError=journal
+
+# Numa VM que tenha um clone git de verdade, em vez do rsync de hoje:
+# Environment=PRISMA_DEPLOY_GIT_PULL=1
+
+# Sem [Install] de propósito: quem é habilitado é o prisma-deploy.path.
+# Este serviço só roda quando ele chama.

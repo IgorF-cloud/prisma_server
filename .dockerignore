@@ -6,3 +6,6 @@ npm-debug.log
 data
 downloads
 version.json
+# ops/ é bind mount e roda no HOST — dentro da imagem não serve pra nada
+# (e os logs de build não têm por que virar camada).
+ops

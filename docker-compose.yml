@@ -88,10 +88,16 @@
 # Portas que precisam estar abertas no firewall/grupo de segurança da VM
 # (e no roteador, se a VM estiver atrás de NAT) — já com o deslocamento
 # acima:
-#   - 5000/tcp        — o prisma_server (ajuste se mudar PORT no .env;
-#                        PORT em si continua 3000, é só o mapeamento
-#                        externo que virou 5000)
-#   - 5880/tcp        — sinalização do LiveKit (WebSocket)
+#   - ~~5000/tcp~~     — NÃO abrir mais (2026-09-10). A API entra pelo
+#                        nginx (80/443); a 5000 nem é publicada pelo
+#                        Compose. Deixá-la aberta com o
+#                        `app.set("trust proxy", 1)` ligado no server.js
+#                        é um buraco — ver o comentário no serviço
+#                        prisma_server e o topo de auth/rateLimit.js
+#   - 5880/tcp        — sinalização do LiveKit (WebSocket). Continua
+#                        direto, sem proxy: o app fala
+#                        ws://prisma-site.com.br:5880 (domínio, mas nada
+#                        no meio do caminho)
 #   - 5881/tcp        — ICE/TURN fallback (TCP) do LiveKit
 #   - 60000-60100/udp — mídia (RTP/ICE) do LiveKit — ajuste o range aqui
 #                        se precisar de mais participantes simultâneos
@@ -100,16 +106,72 @@
 #   - 5885/udp        — mídia (RTP/ICE) do WHIP (ingress)
 #   - 5935/tcp        — RTMP (só se um dia usar RTMP em vez de WHIP; pode
 #                        deixar fechado enquanto só usar WHIP)
+#   - 80/tcp          — nginx (site). NÃO PODE ficar fechada nem depois
+#                        do HTTPS: é por ela que o Let's Encrypt valida o
+#                        domínio, na emissão E a cada renovação
+#   - 443/tcp         — nginx (site em HTTPS)
+#
+# 80 e 443 são as duas ÚNICAS portas desta stack que não seguem o
+# deslocamento +2000 explicado acima — navegador não digita porta, e um
+# site em :2080 não é um site. Nenhuma das duas conflita com a stack do
+# token_api, que não usa nem uma nem outra.
 
 services:
+  # Banco (2026-09-10) — substituiu o data/userList.json e o version.json.
+  #
+  # SEM `ports:` de propósito: só a rede interna do Compose alcança. O
+  # prisma_server é vizinho dele aqui dentro, então não há motivo pra
+  # expor a 5432 na VM — e assim isto NÃO entra no conflito de portas com
+  # a stack do token_api (ver o cabeçalho deste arquivo e o item 10 do
+  # ROADMAP).
+  #
+  # O volume `pgdata` guarda TUDO: as tabelas E os dados. Não existe
+  # "volume do schema" separado — apagar este volume apaga todos os
+  # usuários. Por isso mudanças de schema entram como migration (arquivo
+  # novo em db/migrations/, aplicado no boot do prisma_server), e nunca
+  # como "apaga o volume e sobe de novo".
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${PGDATABASE}
+      POSTGRES_USER: ${PGUSER}
+      POSTGRES_PASSWORD: ${PGPASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # `$$` (dois cifrões) e não `$`: com um só, o COMPOSE interpola a
+      # variável a partir do .env — onde ela não existe (lá os nomes são
+      # PGUSER/PGDATABASE) — e o comando vira `pg_isready -U -d`, sem
+      # usuário nem banco. Corrigido em 2026-09-10; com `$$` a expansão
+      # acontece dentro do container, onde POSTGRES_USER/POSTGRES_DB
+      # realmente existem (foram definidos logo acima).
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   redis:
     image: redis:7-alpine
     restart: unless-stopped
     ports:
       - "127.0.0.1:5379:6379"
 
+  # VERSÃO FIXA DESDE 2026-10-20 — não volte pra `latest`.
+  #
+  # A v1.13.7 (a que o `latest` tinha baixado e que ficou parada no cache
+  # da VM, porque `up --build` não faz pull) tem um panic em
+  # IOInfoService.UpdateIngressState (ioservice_ingress.go:82): quando um
+  # host encerra a live, o DeleteIngress corre contra o aviso de estado
+  # do próprio Ingress, o LoadIngress devolve a info com State nil, e o
+  # processo INTEIRO cai. Junto vão TODAS as salas no ar — foi o
+  # "fulano parou a live e derrubou a de todo mundo" de 12/10 e 20/10.
+  # Corrigido upstream no livekit/livekit#4806, que saiu na v1.13.10.
+  #
+  # Pra atualizar: troque a tag aqui, `docker compose pull livekit-server`
+  # e `up -d`. Com tag fixa, a versão que roda é a que está escr+-+ita aqui.
   livekit-server:
-    image: livekit/livekit-server:latest
+    image: livekit/livekit-server:v1.13.10
     restart: unless-stopped
     ports:
       - "5880:5880/tcp"
@@ -153,24 +215,184 @@ services:
   prisma_server:
     build: .
     restart: unless-stopped
-    ports:
-      - "5000:5000/tcp"
-    # ./data guarda userList.json (cadastro/login) — bind mount de propósito:
-    # server.js é copiado pra DENTRO da imagem a cada build (`build: .`
-    # acima), então qualquer coisa gravada só no filesystem da imagem se
-    # perderia no próximo `docker compose up -d --build`. Sem isso, toda
-    # atualização do servidor apagaria os usuários cadastrados.
+    # SEM `ports:` desde 2026-09-10 — a API passou a entrar SÓ pelo nginx
+    # (443/80), que alcança este container pela rede interna do Compose,
+    # sem precisar de porta publicada. Dá pra fechar a 5000 no firewall
+    # da VM também.
     #
-    # ./downloads e ./version.json (auto-atualização do app, ver
-    # RELEASE.md do Electron): também bind mount, de propósito — publicar
-    # uma versão nova do app é só trocar o .exe em downloads/ e atualizar
-    # version.json, sem precisar rebuildar/reiniciar este container.
+    # ⚠️ NÃO devolva essa porta sem tirar o `app.set("trust proxy", 1)`
+    # do server.js no mesmo movimento. As duas coisas juntas são um
+    # buraco: com a 5000 aberta dá pra ignorar o nginx e inventar o
+    # próprio X-Forwarded-For, ganhando um balde de rate limit novo por
+    # requisição. Explicação completa no topo de auth/rateLimit.js.
+    #
+    # ⚠️ Consequência pra quem já tinha o app instalado: instalações
+    # feitas ANTES de 2026-09-10 apontam pra http://143.20.0.54:5000 e
+    # param de funcionar aqui. O instalador novo apaga o config.json
+    # antigo (seção [InstallDelete] do prisma.iss), então a primeira
+    # atualização conserta a máquina — mas quem estiver numa build velha
+    # demais pra se atualizar precisa reinstalar.
+    # ./data continua bind mount mesmo depois do banco (2026-09-10): os
+    # usuários saíram daqui pro Postgres, mas as FOTOS de avatar
+    # (data/avatars/<id>.webp) e o cache da lista de jogos do Discord
+    # continuam sendo arquivo. Como o server.js é copiado pra dentro da
+    # imagem a cada build, sem este mount tudo isso se perderia no
+    # próximo `docker compose up -d --build`.
+    #
+    # ./downloads: o instalador em si. Publicar uma versão nova é trocar o
+    # .exe aqui e chamar PUT /version — sem rebuildar o container.
+    #
+    # O mount do ./version.json SAIU junto com o arquivo: a versão vive na
+    # tabela app_version agora. Deixar o mount apontando pra um arquivo
+    # inexistente faria o Docker criar uma PASTA chamada version.json no
+    # host no próximo up.
+    # ./ops: a caixa de correio do botão "Docker" do painel (2026-09-21).
+    # A API escreve um pedido em ops/requests/ e lê de volta o log que o
+    # script do HOST escreve em ops/logs/ — ver ops/README.md pro porquê
+    # de o build não rodar aqui dentro.
     volumes:
       - ./data:/app/data
       - ./downloads:/app/downloads
-      - ./version.json:/app/version.json
+      - ./ops:/app/ops
     env_file:
       - .env
     depends_on:
-      - redis
-      - livekit-server
+      # `service_healthy` (e não só o nome) porque o servidor roda as
+      # migrations no boot: sem esperar o Postgres aceitar conexão, o
+      # primeiro start morreria e ficaria em loop de restart. O runner
+      # ainda tem uma espera própria por cima disso (db/index.js), pro
+      # caso do initdb demorar mais que o healthcheck numa VM lenta.
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      livekit-server:
+        condition: service_started
+
+  # Site / landing page (2026-09-10) — projeto prisma_webpage, em
+  # MY PROJECTS/react. Serve os arquivos estáticos e faz proxy de DUAS
+  # rotas do prisma_server: /downloads (o instalador) e /version/public
+  # (número da versão exibido no botão).
+  #
+  # A API do app NÃO passa por aqui de propósito. Colocá-la atrás do
+  # nginx exigiria `app.set("trust proxy", 1)` no server.js — sem isso o
+  # rate limiting (auth/rateLimit.js) passa a ver todas as requisições
+  # vindo do IP do container do nginx e tranca TODO MUNDO junto no
+  # primeiro excesso. Decisão: fazer isso como passo próprio, quando o
+  # painel web (item 4) precisar.
+  #
+  # O conteúdo do site vem do bind mount ./www — não há build de site na
+  # VM. Publicar é copiar o `dist/` pra lá, igual o instalador em
+  # downloads/. Ver DEPLOY-SITE.md.
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./www:/usr/share/nginx/html:ro
+      - ./nginx/templates:/etc/nginx/templates:ro
+      - ./nginx/snippets:/etc/nginx/snippets:ro
+      # Neutraliza o default.conf que vem DENTRO da imagem — ver o
+      # comentário no próprio arquivo. Sem isto, `curl localhost` de
+      # dentro da VM não bate no site nem na API.
+      - ./nginx/no-default.conf:/etc/nginx/conf.d/default.conf:ro
+      # Os dois volumes do certbot. `certbot-www` é a pasta onde o
+      # certbot escreve o arquivo do desafio e de onde o nginx serve
+      # ele — os dois PRECISAM enxergar o mesmo volume, é o único ponto
+      # de encontro entre eles.
+      - certbot-conf:/etc/letsencrypt:ro
+      - certbot-www:/var/www/certbot:ro
+    environment:
+      # Substituído nos arquivos de nginx/templates pelo entrypoint da
+      # imagem oficial. Preencher no .env quando o domínio existir.
+      DOMAIN: ${DOMAIN}
+      # Sem este filtro o envsubst também trocaria $host, $uri,
+      # $remote_addr e companhia — que são variáveis DO NGINX — por
+      # string vazia, e a config sairia quebrada de um jeito difícil de
+      # enxergar.
+      NGINX_ENVSUBST_FILTER: "DOMAIN"
+    # ⚠️⚠️ A ARMADILHA DO `command` NA IMAGEM OFICIAL DO NGINX ⚠️⚠️
+    #
+    # Um comentário ANTERIOR aqui dizia que "o command sobrescreve só o
+    # CMD, e o ENTRYPOINT (que roda o envsubst nos templates) continua
+    # valendo". Está ERRADO, e custou um deploy travado em 2026-09-16.
+    #
+    # O entrypoint roda, sim — mas ele só processa os templates quando o
+    # PRIMEIRO argumento é `nginx`. O /docker-entrypoint.sh da imagem faz
+    # literalmente isto:
+    #
+    #     if [ "$1" = "nginx" ] || [ "$1" = "nginx-debug" ]; then
+    #         ...roda tudo que está em /docker-entrypoint.d/...
+    #     fi
+    #     exec "$@"
+    #
+    # Com `command: /bin/sh -c "..."`, o `$1` é `/bin/sh`. O `if` não
+    # entra, o envsubst NÃO roda, nenhum arquivo é gerado em conf.d/ e o
+    # nginx sobe sem config nenhuma — com o ${DOMAIN} nunca substituído.
+    #
+    # A correção é reinvocar o entrypoint COM `nginx` na frente, que é o
+    # que a linha abaixo faz. Assim volta a rodar tudo que está em
+    # /docker-entrypoint.d/, e não só o envsubst: chamar
+    # `/docker-entrypoint.d/20-envsubst-on-templates.sh` direto também
+    # resolve o sintoma, mas deixa de fora os outros scripts da pasta
+    # (resolvers locais, ajuste de worker_processes) e passa a depender
+    # de um nome de arquivo que é detalhe interno da imagem.
+    #
+    # O `exec` no fim não é enfeite: sem ele o PID 1 é o `sh`, que não
+    # repassa sinal nenhum — `docker compose stop` mandaria SIGTERM pro
+    # shell e o nginx morreria no SIGKILL do timeout. Com `exec`, o
+    # nginx É o PID 1 e recebe o sinal.
+    #
+    # O laço de reload existe porque o nginx carrega o certificado na
+    # memória UMA vez: sem ele, a renovação automática do certbot troca
+    # o arquivo em disco e o site continua servindo o certificado antigo
+    # até vencer. Ele vai pra segundo plano ANTES do exec e sobrevive a
+    # ele — processo em segundo plano não morre quando o pai se troca.
+    #
+    # 24h e não 6h (ajustado em 2026-09-10, quando o WebSocket de salas
+    # passou a atravessar o nginx): um `reload` não derruba conexão
+    # aberta — o nginx mantém os workers antigos vivos até elas
+    # fecharem — mas conexões LONGAS, como o /ws/rooms de quem deixa o
+    # app aberto o dia inteiro, seguram esses workers, e eles se
+    # acumulam a cada reload. Renovação de certificado acontece a cada
+    # ~60 dias; 6h era exagero, 24h é de sobra.
+    command: >
+      /bin/sh -c "(while :; do sleep 24h & wait $${!}; nginx -s reload; done) & exec /docker-entrypoint.sh nginx -g 'daemon off;'"
+    depends_on:
+      - prisma_server
+
+  # Emissão e renovação do certificado (Let's Encrypt).
+  #
+  # A PRIMEIRA emissão é manual e feita uma vez só (ver DEPLOY-SITE.md) —
+  # este serviço aqui cuida apenas da renovação, que roda a cada 12h e
+  # não faz nada enquanto faltar mais de 30 dias pro vencimento.
+  #
+  # `$${!}` com dois cifrões: o Compose interpola `${...}` antes de
+  # entregar a string pro shell, e `$!` (PID do último processo em
+  # segundo plano) precisa chegar intacto no `sh`.
+  certbot:
+    image: certbot/certbot:latest
+    restart: unless-stopped
+    volumes:
+      - certbot-conf:/etc/letsencrypt
+      - certbot-www:/var/www/certbot
+    entrypoint: >
+      /bin/sh -c "trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done"
+
+# Volume nomeado (e não bind mount) pro Postgres: o diretório de dados
+# dele precisa de permissões/ownership que um bind mount de pasta do
+# host costuma atrapalhar. Fica sob controle do Docker — `docker volume
+# ls` mostra, e um `docker compose down` NÃO apaga (só `down -v`).
+volumes:
+  pgdata:
+  # Certificados e a config do Let's Encrypt. Volume nomeado, não bind
+  # mount: tem chave privada dentro, com permissões que o certbot
+  # gerencia. `docker compose down` NÃO apaga (só `down -v`) — o que
+  # importa aqui, porque o Let's Encrypt limita a 5 emissões por semana
+  # pro mesmo domínio, e perder isso à toa custa dias de espera.
+  certbot-conf:
+  # Pasta do desafio HTTP-01, compartilhada entre certbot (escreve) e
+  # nginx (serve). Efêmera por natureza — os arquivos vivem segundos.
+  certbot-www:

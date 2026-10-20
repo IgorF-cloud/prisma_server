@@ -1,0 +1,74 @@
+# Configuração do nginx — ETAPA 1: SÓ HTTP.
+#
+# É esta que está ativa por padrão, e é ela que tem que rodar ANTES de
+# existir certificado nenhum. O motivo é um ovo-e-galinha clássico: o
+# Let's Encrypt precisa alcançar http://SEU_DOMINIO/.well-known/... pra
+# emitir o certificado, mas um `ssl_certificate` apontando pra um
+# arquivo que ainda não existe faz o nginx SE RECUSAR A SUBIR. Se o
+# nginx não sobe, o desafio nunca é respondido, e o certificado nunca é
+# emitido.
+#
+# Por isso são dois arquivos, e não um com blocos comentados: depois de
+# emitir o certificado (ver DEPLOY-SITE.md), você TROCA um pelo outro —
+#
+#   cd nginx/templates
+#   mv prisma.conf.template     prisma.conf.template.off
+#   mv prisma-https.conf.template.off  prisma.conf.template
+#   docker compose restart nginx
+#
+# Só arquivos terminados em `.template` são processados pela imagem
+# oficial do nginx, então o que estiver com `.off` fica simplesmente
+# ignorado — sem risco de os dois valerem ao mesmo tempo e brigarem pela
+# porta 80.
+#
+# ${DOMAIN} vem do .env e é substituído no boot pelo entrypoint da imagem
+# nginx (envsubst). O `NGINX_ENVSUBST_FILTER` no docker-compose limita a
+# substituição a essa variável — sem ele, o envsubst comeria também o
+# $host, $uri e companhia, que são variáveis DO NGINX e precisam chegar
+# intactas no arquivo final.
+
+server {
+    # `default_server` porque a imagem oficial do nginx traz um
+    # /etc/nginx/conf.d/default.conf próprio, que também escuta a 80 e
+    # responde por QUALQUER host. Sem isto, acessar a VM pelo IP (ou por
+    # um domínio ainda não propagado) cairia na página de boas-vindas do
+    # nginx em vez do site — muito confuso justamente na hora de testar,
+    # antes do DNS estar de pé. Com `default_server`, este bloco vira o
+    # padrão e o outro só responderia por `localhost`.
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name ${DOMAIN} www.${DOMAIN};
+
+    # Desafio HTTP-01 do Let's Encrypt. Precisa vir ANTES de qualquer
+    # outra regra e nunca pode ser redirecionado — na etapa 2 (HTTPS)
+    # este bloco continua idêntico e continua em HTTP puro, senão a
+    # renovação automática para de funcionar daqui a 90 dias.
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    include /etc/nginx/snippets/prisma-app.conf;
+}
+
+# --- Painel de administração (2026-09-16) --------------------------------
+#
+# Segundo site no mesmo nginx, separado por `server_name`. Sem
+# `default_server` de propósito: host desconhecido (ou o IP puro da VM)
+# tem que cair no site público, nunca no painel.
+#
+# ⚠️ Antes de isto funcionar, faltam duas coisas FORA daqui:
+#   1. registro A de `admin` no DNS, apontando pro mesmo IP;
+#   2. o certificado precisa INCLUIR este nome — `certbot ... --expand`
+#      com os três domínios. O `renew` sozinho não acrescenta nome
+#      nenhum: ele renova exatamente o que já foi emitido.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name admin.${DOMAIN};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    include /etc/nginx/snippets/prisma-admin.conf;
+}

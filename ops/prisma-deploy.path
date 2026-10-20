@@ -1,0 +1,13 @@
+[Unit]
+Description=Observa pedidos de build vindos do painel do Prisma
+Documentation=file:/opt/prisma/ops/README.md
+
+[Path]
+# Dispara o serviço assim que a API escrever um pedido aqui. É o único
+# caminho de ida entre o container e o host — ver o cabeçalho do
+# deploy.sh pro porquê de não ser o socket do Docker.
+PathExistsGlob=/opt/prisma/ops/requests/*.json
+Unit=prisma-deploy.service
+
+[Install]
+WantedBy=multi-user.target

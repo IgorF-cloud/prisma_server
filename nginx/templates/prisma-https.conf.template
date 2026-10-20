@@ -1,0 +1,99 @@
+# Configuração do nginx — ETAPA 2: HTTP + HTTPS.
+#
+# Este arquivo está DESLIGADO (sufixo `.off`) até você emitir o
+# certificado. Ligar é renomear os dois, na ordem, e reiniciar:
+#
+#   cd nginx/templates
+#   mv prisma.conf.template            prisma.conf.template.off
+#   mv prisma-https.conf.template.off  prisma.conf.template
+#   docker compose restart nginx
+#
+# Se ligar ANTES de o certificado existir, o nginx não sobe (ele valida
+# o caminho do `ssl_certificate` no boot) e o site fica fora do ar —
+# junto com o desafio ACME, o que impede emitir o certificado. É por
+# isso que a etapa 1 existe.
+#
+# Ver DEPLOY-SITE.md pro passo a passo completo.
+
+# --- Porta 80: só o desafio ACME e o redirecionamento --------------------
+server {
+    # `default_server` pelo mesmo motivo da etapa 1: a imagem traz um
+    # default.conf que também escuta a 80 e responderia por qualquer
+    # host que não case com o server_name abaixo.
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    # `admin.` entra aqui junto (2026-09-16): o redirecionamento pra
+    # HTTPS e o desafio ACME valem igual pros dois sites.
+    server_name ${DOMAIN} www.${DOMAIN} admin.${DOMAIN};
+
+    # Continua em HTTP puro, e continua ANTES do redirect: a RENOVAÇÃO
+    # (a cada ~60 dias, pelo serviço certbot) usa exatamente este
+    # caminho. Redirecionar isto pra HTTPS quebra a renovação, e o
+    # sintoma só aparece três meses depois, com o certificado vencendo.
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# --- Porta 443: o site de verdade ----------------------------------------
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    http2 on;
+    server_name ${DOMAIN} www.${DOMAIN};
+
+    # Caminhos que o certbot cria dentro do volume `certbot-conf`. O
+    # nome da pasta é o PRIMEIRO domínio passado no `certonly -d` — se
+    # você emitir para www.dominio primeiro, é esse nome que aparece
+    # aqui, não o domínio raiz.
+    ssl_certificate     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    # HSTS fica COMENTADO de propósito. Ele manda o navegador recusar
+    # http:// neste domínio por 2 anos, e o navegador OBEDECE mesmo que
+    # você desligue isto depois — não dá pra voltar atrás pelo servidor.
+    # Ligue só quando o HTTPS estiver estável há alguns dias e você tiver
+    # certeza de que nada no domínio precisa de HTTP.
+    # add_header Strict-Transport-Security "max-age=63072000" always;
+
+    include /etc/nginx/snippets/prisma-app.conf;
+}
+
+# --- Painel de administração, em HTTPS (2026-09-16) ----------------------
+#
+# Usa o MESMO certificado do site: um certificado do Let's Encrypt pode
+# cobrir vários nomes, e o `--expand` (ver DEPLOY-SITE.md) acrescenta
+# `admin.` ao que já existe, mantendo tudo na mesma pasta `live/`.
+#
+# Emitir um certificado SEPARADO pro subdomínio também funcionaria, mas
+# gastaria uma das 5 emissões semanais do Let's Encrypt por domínio e
+# criaria uma segunda renovação pra dar errado sozinha.
+#
+# Sem `default_server`: host desconhecido cai no site público.
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name admin.${DOMAIN};
+
+    ssl_certificate     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    include /etc/nginx/snippets/prisma-admin.conf;
+}

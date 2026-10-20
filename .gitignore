@@ -6,3 +6,10 @@ node_modules/
 data/
 downloads/
 .vscode/
+
+# O script e as units do systemd (ops/) VÃO pro git — é código de
+# deploy. O que roda gera fica de fora.
+ops/requests/
+ops/logs/
+ops/status/
+ops/.lock

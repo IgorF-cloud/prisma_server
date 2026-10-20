@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- `viewport-fit=cover` + o `interactive-widget` são os dois ajustes
+         que o app precisa no celular: o primeiro deixa o conteúdo ir até
+         a borda em telas com notch (as safe-areas são respeitadas no
+         CSS), e o segundo impede o teclado virtual de ENCOLHER a
+         viewport quando alguém digita no chat — sem ele o vídeo dava um
+         pulo a cada mensagem. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
+    />
+    <link rel="icon" type="image/png" href="/app/icon.png" />
+
+    <title>Prisma · Assistir</title>
+    <meta
+      name="description"
+      content="Assista às transmissões do Prisma direto do navegador — várias lives ao mesmo tempo, chat, modo foco e mini player."
+    />
+    <!-- Precisa de conta pra ver qualquer coisa: não há nada aqui pro
+         buscador indexar além da tela de login. -->
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="theme-color" content="#1b1b1f" />
+    <meta name="color-scheme" content="dark" />
+    <script type="module" crossorigin src="/app/assets/index-1pge0RBE.js"></script>
+    <link rel="modulepreload" crossorigin href="/app/assets/react-DPIr46qh.js">
+    <link rel="modulepreload" crossorigin href="/app/assets/livekit-CgKztATA.js">
+    <link rel="stylesheet" crossorigin href="/app/assets/index-AmVnbgze.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
