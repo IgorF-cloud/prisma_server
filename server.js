@@ -38,6 +38,8 @@ const mail = require("./mail");
 const presence = require("./presence");
 const { setupAdminRoutes } = require("./admin");
 const { setupChatRoutes } = require("./chat");
+const friends = require("./friends");
+const friendsDb = require("./db/friends");
 
 // Situação da conta -> o que dizer pra pessoa no login (2026-09-16).
 //
@@ -133,7 +135,50 @@ const ingressClient = new IngressClient(LIVEKIT_SERVER_URL, LIVEKIT_API_KEY, LIV
 // prisma_server reiniciar no meio de uma transmissão via GStreamer, o
 // DELETE /ingress/:roomName correspondente vira no-op, mas isso é raro o
 // bastante pra não valer a complexidade de persistir).
-const ingressIdByRoom = new Map();
+//
+// UM POR TRANSMISSÃO, E NÃO MAIS UM POR SALA (2026-10-20, webcam). Uma
+// sala pode receber duas: a da TELA (`screen`) e a da WEBCAM (`cam`), cada
+// uma com o seu ingress. Guardar um só fazia o segundo sobrescrever o
+// primeiro, e o primeiro vazava no DELETE.
+// roomName -> { screen?: ingressId, cam?: ingressId }
+const ingressIdsByRoom = new Map();
+
+// --- AS TRANSMISSÕES DE UMA SALA (2026-10-20, item 26 do Electron) -----
+//
+// A sala deixou de ser "a transmissão": ela é do host, e recebe uma ou
+// duas transmissões — a da tela e a da webcam. Quem abre primeiro cria a
+// sala; a segunda se vincula a ela. A sala só acaba quando a ÚLTIMA para.
+//
+// Cada uma publica por um ingress próprio, e o LiveKit só aceita UMA
+// conexão por identity: a da webcam precisa de outra. A da tela continua
+// sendo o username puro (é o que todo app até a 1.5 espera como "o
+// host"); a da webcam ganha o sufixo abaixo. Nome de usuário só aceita
+// letras e números (ver isValidUsername), então o hífen garante que
+// nenhuma conta colide com ele — mesmo truque do "-preview".
+const TRANSMISSION_KINDS = ["screen", "cam"];
+const CAM_IDENTITY_SUFFIX = "-cam";
+
+function parseTransmissionKind(value) {
+  return value === "cam" ? "cam" : "screen";
+}
+
+function camIdentityFor(username) {
+  return `${username}${CAM_IDENTITY_SUFFIX}`;
+}
+
+function isCamIdentity(identity) {
+  return typeof identity === "string" && identity.endsWith(CAM_IDENTITY_SUFFIX);
+}
+
+function transmissionKindOfIdentity(identity) {
+  return isCamIdentity(identity) ? "cam" : "screen";
+}
+
+// O username do host por trás de uma identity de publisher.
+function hostUsernameFromIdentity(identity) {
+  if (!identity) return null;
+  return isCamIdentity(identity) ? identity.slice(0, -CAM_IDENTITY_SUFFIX.length) : identity;
+}
 
 // Item novo (2026-09-04, "sala com senha"): o Electron manda a senha (se
 // o host escolheu uma) junto do POST /ingress, mas a sala em si só passa
@@ -141,7 +186,7 @@ const ingressIdByRoom = new Map();
 // webhook "room_started" chega (ver comentário no /ingress abaixo sobre
 // esse intervalo) — essa senha fica guardada aqui até lá, consumida (e
 // removida) assim que "room_started" a transfere pro roomsState. Mesma
-// limitação já aceita pelo ingressIdByRoom acima: se o prisma_server
+// limitação já aceita pelo ingressIdsByRoom acima: se o prisma_server
 // reiniciar nesse meio-tempo, a senha pendente se perde (raro o
 // bastante pra não valer a complexidade de persistir em disco).
 // roomName -> true, enquanto a sala ainda não existe de fato no LiveKit.
@@ -248,21 +293,93 @@ const roomsWsClients = new Set();
 //   startedAtKept — esta sala é uma live que JÁ estava correndo e foi
 //                   recriada (2026-09-30). O cronômetro dela não
 //                   recomeça; ver beginRoomIncarnation.
-//   publishing    — tem um publisher (o Ingress do host) na sala AGORA
-//                   (2026-10-16). Era o `hostName !== null` que dizia
-//                   isso; desde que a sala nasce com o dono como host
-//                   (ver `room_started`), o `hostName` diz QUEM é o host,
-//                   e é isto que diz se ele está transmitindo.
+//   publishers    — QUAIS transmissões têm publisher na sala AGORA
+//                   (`screen`, `cam`). Era o booleano `publishing`
+//                   (2026-10-16) até a webcam (2026-10-20): com duas
+//                   transmissões, a saída de uma não pode ser lida como
+//                   "o host saiu" enquanto a outra continua no ar.
+//   transmissions — quais transmissões a sala TEM (pedidas e ainda não
+//                   paradas), mesmo antes de o publisher chegar. É o
+//                   que vai pro broadcast como `sources` (ver
+//                   toPublicRoom): a aba de detalhes mostra "Tela",
+//                   "Webcam" ou os dois desde o clique, no mesmo
+//                   espírito do "start instantâneo".
 const roomInternals = new Map();
-// roomName -> { sid, ownerUserId, ownerUsername, ready, startedAtKept, publishing }
+// roomName -> { sid, ownerUserId, ownerUsername, ready, startedAtKept,
+//               publishers: Set, transmissions: { screen, cam } }
 
-function setRoomPublishing(roomName, publishing) {
+function setPublisherPresent(roomName, kind, present) {
   const prev = roomInternals.get(roomName) ?? {};
-  roomInternals.set(roomName, { ...prev, publishing });
+  const publishers = new Set(prev.publishers ?? []);
+  if (present) publishers.add(kind);
+  else publishers.delete(kind);
+  roomInternals.set(roomName, { ...prev, publishers });
 }
 
+function isPublisherPresent(roomName, kind) {
+  return roomInternals.get(roomName)?.publishers?.has(kind) === true;
+}
+
+// Tem ALGUMA transmissão publicando? É a pergunta da derrubada por
+// falta de host.
 function isRoomPublishing(roomName) {
-  return roomInternals.get(roomName)?.publishing === true;
+  return (roomInternals.get(roomName)?.publishers?.size ?? 0) > 0;
+}
+
+// Devolve `true` quando o valor MUDOU — quem chama decide se isso vale
+// um broadcast.
+function setRoomTransmission(roomName, kind, active) {
+  const prev = roomInternals.get(roomName) ?? {};
+  const transmissions = { screen: false, cam: false, ...(prev.transmissions ?? {}) };
+  if (transmissions[kind] === active) return false;
+  transmissions[kind] = active;
+  roomInternals.set(roomName, { ...prev, transmissions });
+  return true;
+}
+
+function roomSources(roomName) {
+  const transmissions = roomInternals.get(roomName)?.transmissions ?? {};
+  return { screen: transmissions.screen === true, cam: transmissions.cam === true };
+}
+
+// UMA TRANSMISSÃO QUE SUMIU SEM AVISAR (2026-10-20).
+//
+// O caminho normal de parar uma transmissão é o app chamar o
+// DELETE /ingress dela, que apaga a marca na hora. Se o app morrer, ou o
+// pipeline cair e o app não conseguir avisar, o publisher sai e ninguém
+// apaga — a sala continuaria anunciando "Webcam" pra sempre, com um tile
+// esperando um vídeo que não vem.
+//
+// Com as DUAS fora, a derrubada por falta de host já cuida de tudo. Isto
+// é pro caso de UMA cair e a outra seguir no ar. O prazo é maior que a
+// folga de reconexão (HOSTLESS_RECONNECT_GRACE_MS, 25s), porque uma troca
+// de fonte da tela também tira o publisher dela da sala por uns segundos.
+const TRANSMISSION_GONE_GRACE_MS = 30000;
+const transmissionGoneTimers = new Map(); // `${roomName}:${kind}` -> Timeout
+
+function cancelTransmissionGone(roomName, kind) {
+  const key = `${roomName}:${kind}`;
+  const timer = transmissionGoneTimers.get(key);
+  if (!timer) return;
+  clearTimeout(timer);
+  transmissionGoneTimers.delete(key);
+}
+
+function scheduleTransmissionGone(roomName, kind) {
+  cancelTransmissionGone(roomName, kind);
+  const key = `${roomName}:${kind}`;
+  const timer = setTimeout(() => {
+    transmissionGoneTimers.delete(key);
+    if (!roomsState.has(roomName) || isPublisherPresent(roomName, kind)) return;
+    if (setRoomTransmission(roomName, kind, false)) {
+      console.warn(
+        `[rooms] sala ${roomName}: transmissão "${kind}" sem publisher há ` +
+          `${TRANSMISSION_GONE_GRACE_MS}ms — tirada da sala`,
+      );
+      broadcastRooms();
+    }
+  }, TRANSMISSION_GONE_GRACE_MS);
+  transmissionGoneTimers.set(key, timer);
 }
 
 function roomOwnerUsername(roomName) {
@@ -369,9 +486,18 @@ function isRoomReady(roomName) {
 //                  esta sala é uma RECRIAÇÃO no meio de uma troca de
 //                  fonte, e não uma live nova. Aí o cronômetro dela não
 //                  pode recomeçar quando o publisher entrar.
+//
+// O `transmissions` NÃO zera aqui (2026-10-20): ele é gravado no
+// /ingress, ANTES de a sala nascer — zerar no `room_started` apagaria a
+// marca da transmissão que acabou de criar esta sala.
 function beginRoomIncarnation(roomName, { startedAtKept }) {
   const prev = roomInternals.get(roomName) ?? {};
-  roomInternals.set(roomName, { ...prev, ready: false, startedAtKept, publishing: false });
+  roomInternals.set(roomName, {
+    ...prev,
+    ready: false,
+    startedAtKept,
+    publishers: new Set(),
+  });
 }
 
 function keepsRoomStartedAt(roomName) {
@@ -399,6 +525,21 @@ function rememberRoomPublisher(roomName, username) {
   const prev = roomInternals.get(roomName) ?? {};
   if (prev.ownerUserId != null || prev.ownerUsername) return;
   roomInternals.set(roomName, { ...prev, ownerUserId: null, ownerUsername: username });
+
+  // O id, pelo nome (2026-10-21). A sala privada passou a depender do
+  // DONO pra saber quem vê (os amigos dele, ver canSeeRoom), e o
+  // `ownerUserId` é o que essa regra consulta. Assíncrono, então só
+  // preenche se ninguém gravou um dono no meio do caminho — e avisa
+  // todo mundo, porque os amigos passam a ver a sala agora.
+  usersDb
+    .findByUsername(username)
+    .then((user) => {
+      const now = roomInternals.get(roomName);
+      if (!user || !now || now.ownerUserId != null || now.ownerUsername !== username) return;
+      roomInternals.set(roomName, { ...now, ownerUserId: user.id });
+      if (roomsState.get(roomName)?.private) broadcastRooms();
+    })
+    .catch((err) => console.error(`Erro ao achar o dono da sala ${roomName}:`, err));
 }
 
 // "Essa pessoa é dona desta sala?" — `true`, `false`, ou `null` quando
@@ -603,15 +744,35 @@ function gameFromMetadata(room) {
   };
 }
 
+// `sources` (2026-10-20): quais transmissões a sala tem — `{ screen, cam }`.
+// Calculado aqui, e não guardado no `roomsState`, porque o webhook
+// reescreve a sala campo a campo e um campo a mais lá é um campo que
+// algum desses lugares esquece.
 function toPublicRoom(room) {
-  return { ...room };
+  return { ...room, sources: roomSources(room.name) };
 }
 
-// Uma sala privada só vai pra quem está na lista de permissão dela (o
-// host e quem aceitou convite). Pública vai pra todo mundo.
+// SALA PRIVADA = O DONO E OS AMIGOS DELE (2026-10-21, etapa 5).
+//
+// Vale pra sala inteira — tela e webcam juntas —, porque é a sala que é
+// privada, não cada transmissão. Pública vai pra todo mundo. Na ordem:
+//
+//   1. barrado (expulso pelo dono) não vê, nem sendo amigo — senão a
+//      amizade desfaria a expulsão no mesmo instante;
+//   2. a lista de permissão: o dono (posto lá no /ingress) e quem
+//      aceitou um convite. O convite SOMA à regra nova enquanto o app
+//      1.5 estiver no ar — ele ainda convida; as rotas saem na etapa 8;
+//   3. amigo do dono.
+//
+// O dono vem do `roomInternals` (o /ingress grava o id). Numa sala que
+// já estava no ar antes deste processo subir, o id chega uns instantes
+// depois (ver rememberRoomPublisher) — até lá só a regra 2 vale.
 function canSeeRoom(room, userId) {
   if (!room.private) return true;
-  return presence.isAllowedInRoom(room.name, userId);
+  if (presence.isBarredFromRoom(room.name, userId)) return false;
+  if (presence.isAllowedInRoom(room.name, userId)) return true;
+  const ownerId = roomInternals.get(room.name)?.ownerUserId ?? null;
+  return ownerId === userId || friends.areFriends(ownerId, userId);
 }
 
 // O `isRoomReady` vem PRIMEIRO porque é a pergunta mais barata e a que
@@ -872,21 +1033,33 @@ async function ensureRoom(roomName, metadata) {
 // Quem está numa sala que já existe no LiveKit: os participantes visíveis
 // e o publisher (o host). Lança se o LiveKit não responder — quem chama
 // decide o que fazer com a dúvida.
+//
+// Com a webcam (2026-10-20) podem ser DOIS publishers. Nenhum deles conta
+// como espectador, e o `hostName` é o username por trás deles — a
+// identity da tela quando ela está lá, senão a da webcam sem o sufixo.
 async function readRoomPresence(roomName) {
   const roomParticipants = await roomService.listParticipants(roomName);
   const visibleParticipants = roomParticipants.filter(
     (p) => !isHiddenPreviewParticipant(p.identity, p.permission),
   );
+  const publishers = visibleParticipants.filter(
+    (p) => p.permission?.canPublish || isCamIdentity(p.identity),
+  );
+  const publisherKinds = [...new Set(publishers.map((p) => transmissionKindOfIdentity(p.identity)))];
+  const screenPublisher = publishers.find((p) => !isCamIdentity(p.identity));
   return {
-    participants: visibleParticipants.map((p) => p.identity),
-    hostName: visibleParticipants.find((p) => p.permission?.canPublish)?.identity ?? null,
+    participants: visibleParticipants
+      .filter((p) => !isCamIdentity(p.identity))
+      .map((p) => p.identity),
+    hostName: hostUsernameFromIdentity((screenPublisher ?? publishers[0])?.identity),
+    publisherKinds,
   };
 }
 
 // Passa a conhecer uma sala que já existe no LiveKit, mas que não está no
 // `roomsState`. Usado no boot e, desde 2026-10-16, também pela
 // reconciliação (ver `reconcileRooms`).
-function adoptExistingRoom(r, { hostName, participants }) {
+function adoptExistingRoom(r, { hostName, participants, publisherKinds = [] }) {
   roomsState.set(r.name, {
     name: r.name,
     hostName,
@@ -915,7 +1088,13 @@ function adoptExistingRoom(r, { hostName, participants }) {
   // host quando ele mandar parar a live.
   setRoomSid(r.name, r.sid);
   rememberRoomPublisher(r.name, hostName);
-  setRoomPublishing(r.name, hostName !== null);
+  // Quais transmissões estão no ar (2026-10-20). O registro de quais
+  // foram PEDIDAS morreu junto com a execução anterior; quem está
+  // publicando é o que sobrou pra saber.
+  for (const kind of publisherKinds) {
+    setPublisherPresent(r.name, kind, true);
+    setRoomTransmission(r.name, kind, true);
+  }
   // Sala com publisher lá dentro é uma live que JÁ está no ar — ela
   // ficou pronta numa execução anterior deste processo, e o `ready`
   // morreu junto com a memória dela (2026-09-30, ver markRoomReady).
@@ -932,7 +1111,7 @@ function adoptExistingRoom(r, { hostName, participants }) {
   try {
     const rooms = await roomService.listRooms();
     for (const r of rooms) {
-      let presence = { hostName: null, participants: [] };
+      let presence = { hostName: null, participants: [], publisherKinds: [] };
       try {
         presence = await readRoomPresence(r.name);
       } catch (err) {
@@ -1161,6 +1340,15 @@ function isValidEmail(email) {
 const DEFAULT_USER_SETTINGS = {
   alertForNewLives: true,
   showViewersOverlay: false,
+  // Alerta de novas lives em três níveis (2026-10-22, migração 010). O
+  // `alertForNewLives` continua aqui pro app 1.5 — ver syncNewLiveAlerts.
+  newLiveAlerts: "all",
+};
+
+// As preferências que são uma ESCOLHA, e não um liga/desliga: o tipo
+// (string) não basta pra validar, o valor tem que ser um destes.
+const SETTINGS_CHOICES = {
+  newLiveAlerts: ["all", "friends", "none"],
 };
 
 // Só as chaves conhecidas, com o default de cada uma preenchendo o que
@@ -1185,9 +1373,24 @@ function parseSettingsPatch(patch) {
   for (const [key, value] of Object.entries(patch)) {
     if (!(key in DEFAULT_USER_SETTINGS)) return null;
     if (typeof value !== typeof DEFAULT_USER_SETTINGS[key]) return null;
+    if (SETTINGS_CHOICES[key] && !SETTINGS_CHOICES[key].includes(value)) return null;
     result[key] = value;
   }
-  return result;
+  return syncNewLiveAlerts(result);
+}
+
+// As duas formas do alerta de novas lives andam juntas (2026-10-22): o
+// app 1.6 grava a escolha (`newLiveAlerts`) e o 1.5 só conhece o
+// liga/desliga (`alertForNewLives`). Quem muda uma muda a outra, pra a
+// mesma conta não tocar num app e ficar muda no outro. O 1.5 religando
+// cai em "all" (era o que o "ligado" dele fazia).
+function syncNewLiveAlerts(patch) {
+  if (patch.newLiveAlerts !== undefined && patch.alertForNewLives === undefined) {
+    patch.alertForNewLives = patch.newLiveAlerts !== "none";
+  } else if (patch.alertForNewLives !== undefined && patch.newLiveAlerts === undefined) {
+    patch.newLiveAlerts = patch.alertForNewLives ? "all" : "none";
+  }
+  return patch;
 }
 
 // A forma do usuário que TODA rota devolve pro cliente. Existe como
@@ -2332,7 +2535,8 @@ app.post("/rooms/:roomName/invite/accept", requireAuth, async (req, res) => {
 //
 // Numa sala PUBLICA o expulso pode entrar de novo pela lista: nao
 // existe "banir" aqui, e a rota nao finge que existe. Numa privada,
-// sim — sair da lista de permissao e definitivo ate um novo convite.
+// sim — o expulso fica BARRADO ate a sala acabar, mesmo sendo amigo
+// do dono (2026-10-21; antes era "ate um novo convite").
 app.post("/rooms/:roomName/kick", requireAuth, async (req, res) => {
   const { roomName } = req.params;
   const { username } = req.body ?? {};
@@ -2362,7 +2566,14 @@ app.post("/rooms/:roomName/kick", requireAuth, async (req, res) => {
     // identity é o que corta a conexão, e o id só serve pra lista de
     // permissão. Não achar o id não é motivo pra deixar a pessoa
     // assistindo.
-    if (target) presence.disallowInRoom(roomName, target.id);
+    // E BARRADO (2026-10-21): numa sala privada, o amigo do dono entra
+    // sem convite, então sair da allow-list não bastaria mais — ele
+    // voltaria pela amizade. Numa pública a lista não é consultada (ver
+    // canSeeRoom), e o expulso pode voltar como sempre pôde.
+    if (target) {
+      presence.disallowInRoom(roomName, target.id);
+      presence.barFromRoom(roomName, target.id);
+    }
 
     // SEM opções, de propósito.
     //
@@ -2386,6 +2597,72 @@ app.post("/rooms/:roomName/kick", requireAuth, async (req, res) => {
     res.status(500).json({ error: "Não foi possível expulsar este usuário." });
   }
 });
+
+// "Saí desta live" (2026-10-20) — o espectador avisando que saiu.
+//
+// Sem isto, quem tira a pessoa da lista é só o webhook `participant_left`
+// do LiveKit, que chega uns 3-4 segundos depois da desconexão — e nesse
+// meio tempo ela continua aparecendo como "assistindo" pra todo mundo
+// (pedido do usuário: não pode). Aqui a lista atualiza na hora; o
+// webhook, quando chegar, só confirma (o filtro dele é idempotente).
+//
+// Só tira A SI MESMO (`req.username`), e nunca o host — a saída do
+// publisher tem regras próprias (folga de reconexão, derrubada da sala)
+// que só o webhook aplica. Aditiva: app/site antigos nunca chamam isto.
+app.post("/rooms/:roomName/leave", requireAuth, (req, res) => {
+  const room = roomsState.get(req.params.roomName);
+  if (!room || room.hostName === req.username || !room.participants.includes(req.username)) {
+    return res.status(204).send();
+  }
+  roomsState.set(room.name, {
+    ...room,
+    participants: room.participants.filter((p) => p !== req.username),
+  });
+  broadcastRooms();
+  res.status(204).send();
+});
+
+// Amizades (2026-10-21) — ver friends.js. Depois de qualquer mudança,
+// as salas privadas dos dois lados são reavaliadas: quem virou amigo
+// passa a ver a sala do outro na hora; quem deixou de ser deixa de ver
+// — e, se estava ASSISTINDO, sai, porque a regra é "só o dono e os
+// amigos" e não "só na hora de entrar".
+const friendsSetup = friends.setupFriends({
+  app,
+  requireAuth,
+  friendRequestRateLimit: rateLimit.friendRequest,
+  friendsDb,
+  usersDb,
+  presence,
+  onFriendshipChanged: (a, b) => {
+    for (const [ownerId, otherId] of [
+      [a, b],
+      [b, a],
+    ]) {
+      for (const room of roomsState.values()) {
+        if (!room.private || roomInternals.get(room.name)?.ownerUserId !== ownerId) continue;
+        if (canSeeRoom(room, otherId)) continue;
+        ejectFromRoomByUserId(room, otherId);
+      }
+    }
+    broadcastRooms();
+  },
+});
+
+// Tira alguém de uma sala no LiveKit pelo id. A identity no LiveKit é o
+// nome, e a lista da sala guarda nomes — então resolve o nome no banco e
+// só derruba se ele estiver mesmo lá. Sem barrar: perdeu o acesso por
+// deixar de ser amigo, e voltar a ser amigo devolve o acesso.
+function ejectFromRoomByUserId(room, userId) {
+  usersDb
+    .findById(userId)
+    .then((user) => {
+      if (!user || !roomsState.get(room.name)?.participants.includes(user.username)) return;
+      console.log(`[friends] ${user.username} deixou de ver a sala privada ${room.name} — saindo`);
+      return roomService.removeParticipant(room.name, user.username);
+    })
+    .catch((err) => console.error(`Erro ao tirar userId=${userId} da sala ${room.name}:`, err));
+}
 
 // Chat temporario da live (2026-09-23) — ver chat.js pro desenho
 // inteiro (por que HTTP+WebSocket e nao data channel do LiveKit) e pra
@@ -2411,6 +2688,14 @@ app.get("/token", requireAuth, async (req, res) => {
   }
 
   const isHost = role === "host";
+
+  // A identity da webcam é reservada (2026-10-20). O LiveKit aceita UMA
+  // conexão por identity: alguém entrando como "<host>-cam" derrubaria a
+  // webcam do host na hora. Nenhum app legítimo pede isso — nome de
+  // usuário não tem hífen (ver CAM_IDENTITY_SUFFIX).
+  if (isCamIdentity(participantName)) {
+    return res.status(400).json({ error: "Nome de participante inválido." });
+  }
 
   // Duas checagens, e as duas são AQUI e não no cliente de propósito:
   // é este endpoint que emite o token do LiveKit, então sem passar por
@@ -2444,11 +2729,12 @@ app.get("/token", requireAuth, async (req, res) => {
         .json({ error: "Sala não encontrada. Confira o código e tente de novo." });
     }
 
-    // 2) SALA PRIVADA: só entra quem está na lista de permissão — o host
-    // e quem aceitou um convite. Isso é o que torna o código de 6
+    // 2) SALA PRIVADA: só entra quem pode vê-la — o dono, os amigos dele
+    // e quem aceitou um convite, menos os barrados (ver canSeeRoom, a
+    // MESMA regra da lista de salas). Isso é o que torna o código de 6
     // dígitos inofensivo numa sala privada: adivinhar o código não
     // basta, e são só 900 mil combinações.
-    if (room?.private && !presence.isAllowedInRoom(roomName, req.userId)) {
+    if (room?.private && !canSeeRoom(room, req.userId)) {
       return res.status(403).json({ error: "Esta transmissão é privada." });
     }
   }
@@ -2496,6 +2782,8 @@ function cleanupFinishedRoom(roomName) {
   cancelPendingHostlessRoomTeardown(roomName);
   // Idem pro aviso de reconexão: a sala acabou, ninguém vai voltar pra ela.
   reconnectNotices.delete(roomName);
+  // E pra marca de "transmissão sumiu" de cada uma (2026-10-20).
+  for (const kind of TRANSMISSION_KINDS) cancelTransmissionGone(roomName, kind);
   // Limpa o "privada" e o jogo pendentes órfãos, se sobrou algum (ex:
   // ingress criado mas o GStreamer nunca chegou a publicar).
   pendingRoomPrivate.delete(roomName);
@@ -2617,8 +2905,13 @@ app.delete("/rooms/:roomName", requireAuth, async (req, res) => {
 // do encode por software/limitado do getDisplayMedia do Chromium. Devolve
 // { url, streamKey } que o Electron passa direto pro GStreamer
 // (whip-endpoint / auth-token do elemento whipsink).
+//
+// `source` (2026-10-20, webcam): "screen" (padrão — é o que todo app até
+// a 1.5 manda, sem o campo) ou "cam". Com a sala do host JÁ aberta pela
+// outra transmissão, esta se VINCULA a ela: mesma sala, mesma
+// privacidade, outro ingress. Ver TRANSMISSION_KINDS lá em cima.
 app.post("/ingress", requireAuth, async (req, res) => {
-  const { roomName, participantName, private: isPrivate, game } = req.body ?? {};
+  const { roomName, participantName, private: isPrivate, game, source } = req.body ?? {};
 
   if (!roomName || !participantName) {
     return res.status(400).json({
@@ -2636,6 +2929,26 @@ app.post("/ingress", requireAuth, async (req, res) => {
     return res.status(parsedGame.status).json({ error: parsedGame.error });
   }
 
+  const kind = parseTransmissionKind(source);
+
+  // A SALA JÁ EXISTE? (2026-10-20)
+  //
+  // Já no ar (`roomsState`) ou pedida há instantes e ainda esperando o
+  // `room_started` (o dono já está gravado). Nos dois casos esta
+  // transmissão é a SEGUNDA do host, e se vincula à sala dele.
+  const attaching =
+    roomsState.has(roomName) || roomInternals.get(roomName)?.ownerUserId != null;
+
+  // Só o dono vincula uma transmissão à sala. Sem isto, qualquer um que
+  // visse o código de 6 dígitos poderia pendurar a própria webcam na
+  // live dos outros.
+  if (attaching && roomOwnerCheck(roomName, req) === false) {
+    console.warn(
+      `[ingress] ${req.username} tentou vincular "${kind}" à sala ${roomName}, que não é dele — recusado`,
+    );
+    return res.status(403).json({ error: "Esta sala é de outra pessoa." });
+  }
+
   try {
     // ⚠️ A ORDEM DESTE BLOCO IMPORTA (2026-09-29).
     //
@@ -2651,23 +2964,42 @@ app.post("/ingress", requireAuth, async (req, res) => {
     // Por isso tudo que o `room_started` consulta vem primeiro, e a
     // criação da sala é o último passo antes do ingress.
 
-    // Checkbox "Transmissão privada" da tela de iniciar live
-    // (2026-09-10, substituiu a senha de sala). Fica pendente até o
-    // "room_started" chegar e transferir pro roomsState — a sala em si
-    // ainda não existe neste ponto.
-    if (isPrivate) {
-      pendingRoomPrivate.set(roomName, true);
-    } else {
-      pendingRoomPrivate.delete(roomName);
-    }
+    let gameChanged = false;
+    if (!attaching) {
+      // Checkbox "Transmissão privada" da tela de iniciar live
+      // (2026-09-10, substituiu a senha de sala). Fica pendente até o
+      // "room_started" chegar e transferir pro roomsState — a sala em si
+      // ainda não existe neste ponto.
+      if (isPrivate) {
+        pendingRoomPrivate.set(roomName, true);
+      } else {
+        pendingRoomPrivate.delete(roomName);
+      }
 
-    // Idem pro jogo/janela. O `delete` no ramo vazio importa tanto
-    // quanto o `set`: o código de sala tem 6 dígitos e é reaproveitado,
-    // então um pendente órfão de uma live anterior viraria o "jogo" desta.
-    if (parsedGame.game) {
-      pendingRoomGame.set(roomName, parsedGame.game);
-    } else {
-      pendingRoomGame.delete(roomName);
+      // Idem pro jogo/janela. O `delete` no ramo vazio importa tanto
+      // quanto o `set`: o código de sala tem 6 dígitos e é reaproveitado,
+      // então um pendente órfão de uma live anterior viraria o "jogo" desta.
+      if (parsedGame.game) {
+        pendingRoomGame.set(roomName, parsedGame.game);
+      } else {
+        pendingRoomGame.delete(roomName);
+      }
+    } else if (kind === "screen" && parsedGame.game) {
+      // VINCULANDO À SALA QUE JÁ EXISTE: a privacidade é a da sala (o
+      // `private` daqui é ignorado — no app o seletor aparece travado).
+      // O jogo, não: uma sala aberta pela webcam não tem jogo nenhum, e
+      // a tela chegando é justamente quem traz um. A webcam nunca mexe
+      // no jogo.
+      const room = roomsState.get(roomName);
+      if (room) {
+        if (!sameGameReport(room.game, parsedGame.game)) {
+          roomsState.set(roomName, { ...room, game: parsedGame.game });
+          syncRoomMetadata(roomName);
+          gameChanged = true;
+        }
+      } else {
+        pendingRoomGame.set(roomName, parsedGame.game);
+      }
     }
 
     // BUG REAL corrigido em 2026-09-13: o HOST nunca entrava na
@@ -2707,23 +3039,58 @@ app.post("/ingress", requireAuth, async (req, res) => {
     // primeiro instante: é ele que sobrevive a um restart deste
     // processo, e entre criar a sala e o primeiro sync existe uma janela
     // em que uma live privada voltaria como pública.
-    await ensureRoom(roomName, isPrivate ? JSON.stringify({ private: true }) : undefined);
+    //
+    // Vinculando, a sala já existe e o `createRoom` a devolve como está;
+    // o metadata vai mesmo assim, pelo mesmo motivo do /reconnecting: se
+    // ela tiver acabado de ser recolhida, renasce sabendo o que era.
+    let roomMetadata = isPrivate ? JSON.stringify({ private: true }) : undefined;
+    if (attaching) {
+      const known = roomMetadataPayload(roomsState.get(roomName));
+      roomMetadata = Object.keys(known).length > 0 ? JSON.stringify(known) : undefined;
+    }
+    await ensureRoom(roomName, roomMetadata);
+
+    // A MESMA transmissão pedindo de novo (um start que falhou e foi
+    // tentado outra vez): o ingress anterior dela sai antes, senão
+    // ficaria pendurado sem ninguém pra apagá-lo.
+    const ingressIds = ingressIdsByRoom.get(roomName) ?? {};
+    if (ingressIds[kind]) {
+      await ingressClient.deleteIngress(ingressIds[kind]).catch(() => {});
+    }
 
     const ingress = await ingressClient.createIngress(IngressInput.WHIP_INPUT, {
-      name: roomName,
+      // O nome da tela continua sendo o código da sala, como sempre foi.
+      name: kind === "cam" ? `${roomName}${CAM_IDENTITY_SUFFIX}` : roomName,
       roomName,
-      participantIdentity: participantName,
+      participantIdentity: kind === "cam" ? camIdentityFor(participantName) : participantName,
       participantName,
       // WHIP já chega pronto (H264 do encoder de hardware) — sem isso o
       // LiveKit recodificaria de novo no servidor à toa.
       enableTranscoding: false,
     });
 
-    ingressIdByRoom.set(roomName, ingress.ingressId);
+    ingressIdsByRoom.set(roomName, { ...ingressIds, [kind]: ingress.ingressId });
+
+    // A sala passa a anunciar esta transmissão desde já, antes do
+    // primeiro frame — mesmo espírito do "start instantâneo". Numa sala
+    // que ainda vai nascer, quem anuncia é o `room_started`.
+    const sourcesChanged = setRoomTransmission(roomName, kind, true);
+    cancelTransmissionGone(roomName, kind);
+    if ((sourcesChanged || gameChanged) && roomsState.has(roomName)) broadcastRooms();
+
+    console.log(
+      `[ingress] sala ${roomName}: transmissão "${kind}" criada` +
+        (attaching ? " (vinculada à sala que já existia)" : ""),
+    );
 
     res.json({ url: ingress.url, streamKey: ingress.streamKey });
   } catch (err) {
     console.error("Erro ao criar ingress:", err);
+    // Vinculando, a sala continua de pé com a outra transmissão — só
+    // esta sai do anúncio.
+    if (attaching && setRoomTransmission(roomName, kind, false) && roomsState.has(roomName)) {
+      broadcastRooms();
+    }
     // Não deixa rastro de uma live que não chegou a existir (2026-09-29).
     //
     // O código de sala tem 6 dígitos e é reaproveitado. Um dono ou uma
@@ -2735,7 +3102,11 @@ app.post("/ingress", requireAuth, async (req, res) => {
     // Só quando a sala não chegou a nascer: se o `ensureRoom` passou e
     // quem falhou foi o ingress, a sala existe e quem limpa é o
     // `cleanupFinishedRoom` quando o LiveKit a recolher.
-    if (!roomsState.has(roomName)) {
+    //
+    // E nunca vinculando (2026-10-20): aí o dono e a privacidade são da
+    // OUTRA transmissão, que pode estar justamente esperando o
+    // `room_started` com eles.
+    if (!attaching && !roomsState.has(roomName)) {
       pendingRoomPrivate.delete(roomName);
       pendingRoomGame.delete(roomName);
       roomInternals.delete(roomName);
@@ -2770,9 +3141,28 @@ app.delete("/ingress/:roomName", requireAuth, async (req, res) => {
     );
   }
 
-  const ingressId = ingressIdByRoom.get(roomName);
+  // QUAL transmissão (2026-10-20): `?source=cam` remove só a da webcam e
+  // deixa a tela no ar, e vice-versa. Sem o parâmetro é a tela — é o que
+  // todo app até a 1.5 manda.
+  const kind = parseTransmissionKind(req.query?.source);
+
+  // Parar uma transmissão tira ela do anúncio da sala na hora, tenha o
+  // ingress sumido sozinho ou não.
+  function forgetIngress() {
+    const ids = { ...(ingressIdsByRoom.get(roomName) ?? {}) };
+    delete ids[kind];
+    if (Object.keys(ids).length > 0) ingressIdsByRoom.set(roomName, ids);
+    else ingressIdsByRoom.delete(roomName);
+    cancelTransmissionGone(roomName, kind);
+    if (setRoomTransmission(roomName, kind, false) && roomsState.has(roomName)) {
+      broadcastRooms();
+    }
+  }
+
+  const ingressId = ingressIdsByRoom.get(roomName)?.[kind];
   if (!ingressId) {
-    console.log(`[ingress] DELETE pra sala ${roomName} sem ingress registrado (no-op)`);
+    console.log(`[ingress] DELETE "${kind}" pra sala ${roomName} sem ingress registrado (no-op)`);
+    forgetIngress();
     return res.json({ ok: true });
   }
 
@@ -2780,8 +3170,8 @@ app.delete("/ingress/:roomName", requireAuth, async (req, res) => {
   // resultado real pro cliente poder tentar de novo.
   try {
     await ingressClient.deleteIngress(ingressId);
-    ingressIdByRoom.delete(roomName);
-    console.log(`[ingress] ingress ${ingressId} (sala ${roomName}) removido com sucesso`);
+    forgetIngress();
+    console.log(`[ingress] ingress ${ingressId} ("${kind}", sala ${roomName}) removido com sucesso`);
     return res.json({ ok: true });
   } catch (err) {
     // 404 "ingress does not exist" NÃO é falha (2026-09-18): o objetivo
@@ -2796,7 +3186,7 @@ app.delete("/ingress/:roomName", requireAuth, async (req, res) => {
     // Tirar do mapa junto importa: sem isso o id morto ficaria lá, e uma
     // próxima live no mesmo código de sala tentaria removê-lo de novo.
     if (err?.status === 404 || err?.code === "not_found") {
-      ingressIdByRoom.delete(roomName);
+      forgetIngress();
       console.log(
         `[ingress] ingress ${ingressId} (sala ${roomName}) já não existia (ok)`,
       );
@@ -3177,7 +3567,10 @@ setupAdminRoutes({
   // conta apagada continuaria aparecendo na lista de salas até o próximo
   // restart.
   onUsersChanged: async () => {
-    await refreshUserAvatars();
+    // As amizades da conta apagada já saíram do banco pelo CASCADE; o
+    // cache precisa reler pra não continuar mandando o id dela no
+    // retrato de amigos de quem a tinha.
+    await Promise.all([refreshUserAvatars(), friendsSetup.reload()]);
     broadcastRooms();
   },
   // Publicou uma versão nova: todo app aberto fica sabendo na hora, sem
@@ -3215,6 +3608,11 @@ app.get("/version", requireAuth, async (req, res) => {
       version: info.version,
       url: `/downloads/${info.installerFilename}`,
       sha256: info.sha256,
+      // Chave nova (2026-10-22, migration 011) — só ACRESCENTADA: os apps
+      // até a 1.5 ignoram, e a 1.6 em diante trava o diálogo do login
+      // quando a versão instalada é menor que esta. Nulo = nenhuma
+      // versão é obrigatória.
+      minVersion: info.minVersion,
     });
   } catch (err) {
     console.error("Erro ao ler a versão publicada:", err);
@@ -3540,8 +3938,12 @@ app.post("/webhook", async (req, res) => {
         }
 
         const prev = roomsState.get(event.room.name);
+        // A webcam do host (2026-10-20) é um publisher, nunca um
+        // espectador: não entra na lista (nem na contagem, nem nos sons
+        // de entrada/saída do app).
+        const camPublisher = isCamIdentity(identity);
         const participants =
-          event.event === "participant_joined"
+          event.event === "participant_joined" && !camPublisher
             ? [...new Set([...prev.participants, identity])]
             : prev.participants.filter((p) => p !== identity);
 
@@ -3549,7 +3951,12 @@ app.post("/webhook", async (req, res) => {
         // nunca têm essa flag. Não dá pra assumir "primeiro a entrar" porque
         // ordem de eventos não é garantida — usa a permissão em si.
         const isPublisher =
-          event.event === "participant_joined" && event.participant?.permission?.canPublish;
+          event.event === "participant_joined" &&
+          (event.participant?.permission?.canPublish === true || camPublisher);
+
+        // DE QUAL TRANSMISSÃO é este publisher (2026-10-20): tela ou
+        // webcam. Só tem sentido pra quem publica.
+        const kind = transmissionKindOfIdentity(identity);
 
         // Item 46 do roadmap: o HOST em si saiu — zera hostName JÁ (a
         // sala reflete a realidade: sem publisher agora), mas só derruba
@@ -3562,9 +3969,29 @@ app.post("/webhook", async (req, res) => {
         // meio da live (renomear a conta troca o `hostName`, mas não a
         // identity de quem já está conectado). Pelo nome só, a saída do
         // publisher passaria despercebida e a sala nunca seria derrubada.
-        const hostLeft =
+        const publisherLeft =
           event.event === "participant_left" &&
-          (identity === prev.hostName || event.participant?.permission?.canPublish === true);
+          (identity === prev.hostName ||
+            event.participant?.permission?.canPublish === true ||
+            camPublisher);
+
+        // Quais transmissões têm sinal agora (2026-10-20). Uma que sai
+        // ganha o prazo de "sumiu sem avisar" (ver scheduleTransmissionGone)
+        // — o caminho normal, o app parando ela, já a tirou da sala no
+        // DELETE /ingress.
+        if (isPublisher) {
+          setPublisherPresent(event.room.name, kind, true);
+          cancelTransmissionGone(event.room.name, kind);
+          setRoomTransmission(event.room.name, kind, true);
+        } else if (publisherLeft) {
+          setPublisherPresent(event.room.name, kind, false);
+          scheduleTransmissionGone(event.room.name, kind);
+        }
+
+        // E O HOST SAIU DE VEZ? Só quando a ÚLTIMA transmissão sai
+        // (2026-10-20). Antes era qualquer publisher saindo — com a webcam
+        // isso derrubaria a live da tela ao desligar a câmera.
+        const hostLeft = publisherLeft && !isRoomPublishing(event.room.name);
 
         // A LIVE ENTROU NO AR AGORA? (2026-09-30, ver markRoomReady)
         //
@@ -3582,17 +4009,24 @@ app.post("/webhook", async (req, res) => {
         // `room_started`. Ver beginRoomIncarnation.
         const startsClock = becameReady && !keepsRoomStartedAt(event.room.name);
 
-        // Quem diz se a live tem sinal é o `publishing`; o `hostName`
-        // continua sendo o dono quando o publisher sai (2026-10-16). Antes
-        // ele zerava numa troca de fonte, e a sala virava "Sala ao vivo"
-        // sem nome nem avatar por alguns segundos, e o host não conseguia
-        // convidar, expulsar nem silenciar ninguém nesse intervalo.
-        if (isPublisher) setRoomPublishing(event.room.name, true);
-        else if (hostLeft) setRoomPublishing(event.room.name, false);
+        // Quem diz se a live tem sinal é o `publishers` (acima); o
+        // `hostName` continua sendo o dono quando o publisher sai
+        // (2026-10-16). Antes ele zerava numa troca de fonte, e a sala
+        // virava "Sala ao vivo" sem nome nem avatar por alguns segundos, e
+        // o host não conseguia convidar, expulsar nem silenciar ninguém
+        // nesse intervalo.
+        //
+        // A webcam nunca é o `hostName` (2026-10-20): a identity dela tem
+        // o sufixo. Ela só preenche um host que ninguém conhecia, já sem
+        // o sufixo — a sala aberta só pela webcam depois de um restart.
+        let hostName = prev.hostName;
+        if (isPublisher) {
+          hostName = kind === "screen" ? identity : (prev.hostName ?? hostUsernameFromIdentity(identity));
+        }
 
         roomsState.set(event.room.name, {
           name: event.room.name,
-          hostName: isPublisher ? identity : prev.hostName,
+          hostName,
           participants,
           game: prev.game,
           // Item 42 do roadmap, corrigido em 2026-09-30: o começo da live
@@ -3621,7 +4055,7 @@ app.post("/webhook", async (req, res) => {
           // E, se ninguém souber de quem é esta sala, passa a saber
           // (2026-09-29): só preenche no vazio, então o dono gravado no
           // /ingress continua valendo. Ver rememberRoomPublisher.
-          rememberRoomPublisher(event.room.name, identity);
+          rememberRoomPublisher(event.room.name, hostUsernameFromIdentity(identity));
         } else if (hostLeft) {
           // Avisado = o app está trocando de fonte e já está voltando;
           // sem aviso = o host caiu, e aí vale a folga curta de sempre.
@@ -3808,6 +4242,9 @@ wss.on("connection", (ws, req) => {
         presence: presenceSnapshot(),
       }),
     );
+    // E o retrato das amizades dela (2026-10-21, ver friends.js). Um
+    // `type` novo, que o app 1.5 ignora.
+    socket.send(JSON.stringify({ type: "friends", ...friends.snapshotFor(id) }));
 
     // Avisa os outros que essa pessoa entrou. Só quando é a PRIMEIRA
     // janela dela: abrir uma segunda não muda nada pra ninguém.
@@ -3872,6 +4309,9 @@ async function start() {
     await db.waitForDatabase();
     await db.runMigrations();
     await refreshUserAvatars();
+    // Antes do listen pelo mesmo motivo dos avatares: uma sala privada
+    // não pode sair no primeiro broadcast sem saber quem é amigo do dono.
+    await friendsSetup.reload();
 
     // Avisa, no log, se os e-mails vão sair de verdade ou só aparecer
     // aqui (ver mail.js). Sem isso dá pra rodar semanas em "modo de

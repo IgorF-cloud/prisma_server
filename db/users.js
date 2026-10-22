@@ -15,6 +15,7 @@ const { query } = require("./index");
 const SETTINGS_COLUMNS = {
   alert_for_new_lives: "alertForNewLives",
   show_viewers_overlay: "showViewersOverlay",
+  new_live_alerts: "newLiveAlerts",
 };
 
 // Avatar custom do jeito que os clientes esperam: `{type, version, id,

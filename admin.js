@@ -655,7 +655,11 @@ function setupAdminRoutes({
   // anunciaria uma versão cujo arquivo ainda não chegou, e todo mundo
   // que checasse naquela janela baixaria erro.
   app.post("/admin/version/publish", requireAuth, requireAdmin, async (req, res) => {
-    const { uploadId, version, sha256 } = req.body ?? {};
+    // `mandatory` (2026-10-22): publicar já como obrigatória — a versão
+    // mínima passa a ser esta. Ausente ou false não mexe na mínima que
+    // já existia: publicar uma 1.7.1 opcional depois de uma 1.7
+    // obrigatória continua obrigando quem está abaixo da 1.7.
+    const { uploadId, version, sha256, mandatory } = req.body ?? {};
 
     const source = typeof uploadId === "string" ? uploadPath(uploadId) : null;
     if (!source || !fs.existsSync(source)) {
@@ -690,14 +694,24 @@ function setupAdminRoutes({
 
       fs.renameSync(source, destination);
 
-      const updated = await appVersionDb.set({
+      await appVersionDb.set({
         version,
         sha256: recomputed,
         updatedBy: req.userId,
       });
+      // Rollback pra uma versão abaixo da mínima deixaria a mínima
+      // impossível de cumprir: o app obrigaria a atualizar e não haveria
+      // pra onde. A mínima desce junto com a publicada.
+      if (mandatory === true) {
+        await appVersionDb.setMinVersion(version);
+      } else if (current?.minVersion && compareVersions(current.minVersion, version) > 0) {
+        await appVersionDb.setMinVersion(version);
+      }
+      const updated = await appVersionDb.getForAdmin();
 
       console.log(
         `[admin] ${req.username} publicou a versão ${version} (sha256 ${recomputed.slice(0, 12)}…)` +
+          (mandatory === true ? " — OBRIGATÓRIA" : "") +
           (backedUp ? ` — anterior guardada em .backup/${path.basename(backedUp)}` : ""),
       );
 
@@ -719,6 +733,43 @@ function setupAdminRoutes({
     } catch (err) {
       console.error("[admin] erro ao publicar a versão:", err);
       res.status(500).json({ error: "Erro interno ao publicar a versão" });
+    }
+  });
+
+  // Tornar obrigatória (ou deixar de ser) sem publicar nada (2026-10-22).
+  // `{ minVersion: "1.6.0" }` obriga quem está abaixo dela; `null` solta.
+  //
+  // Não anuncia pelo WebSocket de propósito: quem já está com o app aberto
+  // nunca é obrigado — a regra só vale no próximo login (ver
+  // useAppUpdate.ts no Electron).
+  app.put("/admin/version/min-version", requireAuth, requireAdmin, async (req, res) => {
+    const { minVersion } = req.body ?? {};
+
+    if (minVersion !== null && !isValidVersion(minVersion)) {
+      return res.status(400).json({ error: "Versão inválida. Use algo como 1.0.5." });
+    }
+
+    try {
+      const current = await appVersionDb.getForAdmin();
+      if (!current) return res.status(404).json({ error: "Versão não configurada" });
+
+      // Acima da publicada, ninguém teria pra onde atualizar — o app
+      // obrigaria e o download devolveria a mesma versão de sempre.
+      if (minVersion !== null && compareVersions(minVersion, current.version) > 0) {
+        return res.status(400).json({
+          error: `A versão mínima não pode ser maior que a publicada (${current.version}).`,
+        });
+      }
+
+      await appVersionDb.setMinVersion(minVersion);
+      console.log(
+        `[admin] ${req.username} ` +
+          (minVersion ? `definiu a versão mínima ${minVersion}` : "removeu a versão mínima"),
+      );
+      res.json(await appVersionDb.getForAdmin());
+    } catch (err) {
+      console.error("[admin] erro ao gravar a versão mínima:", err);
+      res.status(500).json({ error: "Erro interno ao gravar a versão mínima" });
     }
   });
   // ------------------------------------------------------------ DOCKER

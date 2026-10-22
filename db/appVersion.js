@@ -16,6 +16,8 @@ function toPublic(row) {
     version: row.version,
     installerFilename: row.installer_filename,
     sha256: row.sha256,
+    // Migration 011. Nulo quando nenhuma versão é obrigatória.
+    minVersion: row.min_version ?? null,
   };
 }
 
@@ -50,10 +52,21 @@ async function set({ version, installerFilename, sha256, updatedBy }) {
   return rows[0] ? toPublic(rows[0]) : null;
 }
 
+// Grava (ou limpa, com null) a versão mínima. Separado do `set` porque
+// o COALESCE de lá não deixa voltar pra nulo — e "não é mais
+// obrigatória" é justamente um null.
+async function setMinVersion(minVersion) {
+  const { rows } = await query(
+    `UPDATE app_version SET min_version = $1 WHERE id = 1 RETURNING *`,
+    [minVersion ?? null],
+  );
+  return rows[0] ? toPublic(rows[0]) : null;
+}
+
 // Pro painel: a mesma linha, com a data e o id de quem publicou.
 async function getForAdmin() {
   const { rows } = await query("SELECT * FROM app_version WHERE id = 1");
   return rows[0] ? toAdmin(rows[0]) : null;
 }
 
-module.exports = { get, set, getForAdmin };
+module.exports = { get, set, setMinVersion, getForAdmin };

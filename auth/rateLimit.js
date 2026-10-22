@@ -123,7 +123,23 @@ const chatSend = rateLimit({
   keyGenerator: (req) => `chat:${req.userId}`,
 });
 
+// --- pedido de amizade (2026-10-21) -------------------------------------
+//
+// Por usuário, pelo mesmo motivo do chat. O que se barra é o "pede,
+// cancela, pede de novo" em laço — cada pedido vira um aviso na tela do
+// outro (e, na etapa 7, uma notificação). 20 em 10 minutos é muito mais
+// do que alguém adicionando os amigos de verdade de uma vez.
+const friendRequest = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Muitos pedidos de amizade seguidos. Tente daqui a pouco." },
+  keyGenerator: (req) => `friend:${req.userId}`,
+});
+
 module.exports = {
+  friendRequest,
   loginByIp,
   loginByUsername,
   register,

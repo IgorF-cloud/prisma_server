@@ -191,6 +191,32 @@ function disallowInRoom(roomName, userId) {
   pendingInvites.get(roomName)?.delete(userId);
 }
 
+// BARRADOS por sala (2026-10-21, amizades).
+//
+// Até aqui a expulsão de uma sala privada era definitiva "de graça":
+// tirar a pessoa da allow-list bastava, porque a allow-list era o único
+// caminho de entrada. Com a regra nova — amigo do dono entra sem
+// convite —, um amigo expulso voltaria no mesmo instante pela amizade.
+// Esta lista vence a amizade (ver canSeeRoom no server.js) e, como o
+// resto deste arquivo, dura a vida da sala: na próxima live do mesmo
+// dono, o amigo expulso entra de novo.
+//
+// roomName -> Set<userId>
+const barredFromRoom = new Map();
+
+function barFromRoom(roomName, userId) {
+  let set = barredFromRoom.get(roomName);
+  if (!set) {
+    set = new Set();
+    barredFromRoom.set(roomName, set);
+  }
+  set.add(userId);
+}
+
+function isBarredFromRoom(roomName, userId) {
+  return barredFromRoom.get(roomName)?.has(userId) ?? false;
+}
+
 // Chamado quando a sala acaba. Sem isso o Map cresceria pra sempre —
 // cada live deixaria uma entrada órfã, e um código de sala reaproveitado
 // (são só 6 dígitos) herdaria a lista de convidados da live anterior.
@@ -299,6 +325,7 @@ function mutedUserIds(roomName) {
 function forgetRoom(roomName) {
   roomAllowList.delete(roomName);
   pendingInvites.delete(roomName);
+  barredFromRoom.delete(roomName);
   // E ISTO que faz o chat ser "temporario, so durante a live": a live
   // acaba -> cleanupFinishedRoom -> forgetRoom -> historico e mutes somem
   // da memoria. Nao ha nenhum outro lugar onde uma mensagem sobreviva.
@@ -320,6 +347,8 @@ module.exports = {
   allowInRoom,
   disallowInRoom,
   isAllowedInRoom,
+  barFromRoom,
+  isBarredFromRoom,
   forgetRoom,
   pushChatMessage,
   chatHistoryFor,

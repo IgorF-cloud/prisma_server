@@ -169,7 +169,7 @@ services:
   # Corrigido upstream no livekit/livekit#4806, que saiu na v1.13.10.
   #
   # Pra atualizar: troque a tag aqui, `docker compose pull livekit-server`
-  # e `up -d`. Com tag fixa, a versão que roda é a que está escr+-+ita aqui.
+  # e `up -d`. Com tag fixa, a versão que roda é a que está escrita aqui.
   livekit-server:
     image: livekit/livekit-server:v1.13.10
     restart: unless-stopped
