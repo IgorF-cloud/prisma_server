@@ -1,3 +1,13 @@
+# MODELO do livekit.yaml — copie para `livekit.yaml` (que fica fora do
+# git) e preencha os três valores marcados com TROQUE:
+#
+#   cp livekit.example.yaml livekit.yaml
+#
+#   1. o nome da chave (`prisma` abaixo) = LIVEKIT_API_KEY do .env
+#   2. o segredo                         = LIVEKIT_API_SECRET do .env
+#      (gere um com: openssl rand -base64 48 | tr -d '/+=' )
+#   3. o IP público da VM no whip_base_url (= HOST do .env)
+#
 # Config do livekit-server pra produção (VM na nuvem), usado pelo
 # docker-compose.yml deste diretório. Esse arquivo é lido diretamente
 # pelo binário do livekit-server (--config) — ele não faz substituição
@@ -57,7 +67,7 @@ keys:
   # Mesma API key/secret do token-server (.env: LIVEKIT_API_KEY/
   # LIVEKIT_API_SECRET) — ATENÇÃO: os dois precisam ser literalmente
   # iguais (esse arquivo não lê o .env, os valores são copiados à mão).
-  homelab: 3gr6fwz5lqnnQMTfe1QYKb7456UkcHALBfhzjpUNOiHzMcwb6j1G3zMIPA8ejOC3
+  prisma: TROQUE_POR_UM_SEGREDO_LONGO_E_ALEATORIO
 
 redis:
   # Nome do serviço no docker-compose.yml (rede bridge padrão do Compose
@@ -73,10 +83,11 @@ redis:
 # sobre o esquema de portas. Atualizar se o IP da VM mudar (mesmo valor
 # de HOST no .env e node_ip no docker-compose.yml).
 ingress:
-  whip_base_url: http://143.20.0.54:5080/w
+  whip_base_url: http://TROQUE_PELO_IP_PUBLICO:5080/w
 
 webhook:
-  api_key: homelab
+  # Tem que ser o MESMO nome de chave do bloco `keys:` acima.
+  api_key: prisma
   # Nome do serviço no docker-compose.yml (rede bridge padrão do Compose
   # tem DNS interno resolvendo nomes de serviço) — prisma_server está na
   # mesma rede, não precisa saltar pelo IP público. Porta 5000 (não a

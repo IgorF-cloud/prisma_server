@@ -1,11 +1,19 @@
+# Instalador do app (publicado pelo painel, não pelo git)
 Prisma-Setup.exe
 
 node_modules/
+
+# Segredos — NUNCA versionar. Os modelos (.env.example e
+# livekit.example.yaml) vão pro git; as cópias preenchidas, não.
 .env
-.env.teste
+.env.*
+!.env.example
+livekit.yaml
+
+# Dados de produção (banco do Postgres fica em volume do Docker;
+# aqui ficam avatares, instaladores e o APK)
 data/
 downloads/
-.vscode/
 
 # O script e as units do systemd (ops/) VÃO pro git — é código de
 # deploy. O que roda gera fica de fora.
@@ -13,3 +21,11 @@ ops/requests/
 ops/logs/
 ops/status/
 ops/.lock
+
+# Editor / SO
+.vscode/
+.idea/
+*.log
+.DS_Store
+Thumbs.db
+desktop.ini

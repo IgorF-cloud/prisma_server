@@ -147,9 +147,9 @@ curl -s https://prisma-site.com.br/app/ | grep -o "<title>[^<]*"
 No painel do registrador, dois registros `A` apontando pro IP da VM:
 
 ```
-@     A    143.20.0.54
-www     A    143.20.0.54
-admin   A    143.20.0.54
+@     A    SEU_IP_PUBLICO
+www     A    SEU_IP_PUBLICO
+admin   A    SEU_IP_PUBLICO
 ```
 
 Conferir antes de seguir (a propagação pode levar minutos ou horas):
@@ -164,7 +164,7 @@ Já está preenchido:
 
 ```
 DOMAIN=prisma-site.com.br
-LETSENCRYPT_EMAIL=igor@tecnoweb.com.br
+LETSENCRYPT_EMAIL=voce@seu-dominio.com
 ```
 
 O e-mail é só pra onde o Let's Encrypt avisa se uma renovação falhar —
@@ -206,7 +206,7 @@ Se `/version/public` devolver **HTML** em vez de JSON, o pedido caiu no
 docker compose run --rm certbot certonly \
   --webroot -w /var/www/certbot \
   -d prisma-site.com.br -d www.prisma-site.com.br -d admin.prisma-site.com.br \
-  --email igor@tecnoweb.com.br \
+  --email voce@seu-dominio.com \
   --agree-tos --no-eff-email
 ```
 
@@ -295,7 +295,7 @@ O aviso está repetido no topo de `auth/rateLimit.js` e no
 
 ## ⚠️ Instalações antigas do app
 
-Builds anteriores a 2026-09-10 apontam pra `http://143.20.0.54:5000`,
+Builds anteriores a 2026-09-10 apontam pra `http://SEU_IP_PUBLICO:5000`,
 que deixa de responder. O endereço agora é **compilado no app**
 (`src/main/config.ts`) — não existe mais `config.json` gravado pelo
 instalador.

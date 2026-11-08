@@ -13,6 +13,7 @@ const {
   IngressClient,
   IngressInput,
   WebhookReceiver,
+  TrackSource,
 } = require("livekit-server-sdk");
 
 // Banco (2026-09-10) — substitui o data/userList.json e o version.json.
@@ -334,12 +335,154 @@ function setRoomTransmission(roomName, kind, active) {
   if (transmissions[kind] === active) return false;
   transmissions[kind] = active;
   roomInternals.set(roomName, { ...prev, transmissions });
+  touchTransmissionClock(roomName, kind, active);
   return true;
 }
 
 function roomSources(roomName) {
   const transmissions = roomInternals.get(roomName)?.transmissions ?? {};
   return { screen: transmissions.screen === true, cam: transmissions.cam === true };
+}
+
+// DE ONDE VEM CADA TRANSMISSÃO (2026-10-28, item 27 do Electron): "app"
+// (o Electron, por ingress/WHIP) ou "web" (o Prisma Web, publicando direto
+// do navegador). Duas fontes de verdade, de propósito:
+//
+//   1. quem PEDE grava na hora (/ingress grava "app", o /publish grava
+//      "web") — a sala anuncia de onde vem desde o clique;
+//   2. o LiveKit COMPLETA quando o publisher entra (o participante do
+//      ingress chega com `kind: INGRESS`, o do navegador com `STANDARD`),
+//      só onde o (1) não gravou nada. É o que sobrevive a um restart
+//      deste processo: a memória do (1) morre junto, e a sala adotada no
+//      boot reaprende pelo (2).
+//
+// É o que sustenta a regra de UMA LIVE POR PESSOA (ver
+// conflictingTransmission) e vai pro broadcast como `origins`, pra app e
+// site mostrarem "você já está transmitindo pelo outro".
+const TRANSMISSION_ORIGINS = ["app", "web"];
+
+// O enum `ParticipantInfo_Kind` do @livekit/protocol. Não vem exportado
+// pelo livekit-server-sdk, e o protocol é dependência indireta (não está
+// no package.json) — requerer ele direto é contar com o hoisting do npm.
+// Os números são do proto e não mudam.
+const PARTICIPANT_KIND_STANDARD = 0;
+const PARTICIPANT_KIND_INGRESS = 1;
+
+function originOfParticipant(participant) {
+  if (participant?.kind === PARTICIPANT_KIND_INGRESS) return "app";
+  if (participant?.kind === PARTICIPANT_KIND_STANDARD) return "web";
+  return null;
+}
+
+function setTransmissionOrigin(roomName, kind, origin) {
+  if (!TRANSMISSION_ORIGINS.includes(origin)) return false;
+  const prev = roomInternals.get(roomName) ?? {};
+  if (prev.origins?.[kind] === origin) return false;
+  roomInternals.set(roomName, { ...prev, origins: { ...(prev.origins ?? {}), [kind]: origin } });
+  return true;
+}
+
+// `{ screen, cam }` com "app", "web" ou `null` — `null` quando a
+// transmissão não está no ar, ou está mas ninguém sabe de onde (sala
+// adotada no boot antes de o publisher dela ser lido).
+function roomOrigins(roomName) {
+  const internals = roomInternals.get(roomName);
+  const result = { screen: null, cam: null };
+  for (const kind of TRANSMISSION_KINDS) {
+    if (internals?.transmissions?.[kind]) result[kind] = internals.origins?.[kind] ?? null;
+  }
+  return result;
+}
+
+// Toda transmissão no ar (ou pedida e ainda não parada) desta pessoa, em
+// qualquer sala.
+function liveTransmissionsOf(req) {
+  const result = [];
+  for (const [roomName, internals] of roomInternals) {
+    if (roomOwnerCheck(roomName, req) !== true) continue;
+    for (const kind of TRANSMISSION_KINDS) {
+      if (!internals.transmissions?.[kind]) continue;
+      result.push({ roomName, kind, origin: internals.origins?.[kind] ?? null });
+    }
+  }
+  return result;
+}
+
+// UMA LIVE POR PESSOA (2026-10-28, decisão do usuário): quem está no ar
+// pelo app não transmite pelo site, e vice-versa. Não é só preferência —
+// as duas publicam a tela com a identity igual ao username, e o LiveKit
+// derruba quem já estava na sala quando chega outra conexão com a mesma
+// identity. Sem a trava, uma transmissão derrubaria a outra sem avisar.
+//
+// Devolve a transmissão que impede esta, ou `undefined`.
+//
+//   - pedido do SITE: barra qualquer transmissão que não seja do site, e
+//     a do site numa OUTRA sala. Tela e webcam do site na mesma sala
+//     continuam juntas, como no app.
+//   - pedido do APP: barra SÓ a do site. O app publicado (1.6) nunca foi
+//     barrado por nada aqui, e continua não sendo pelo que já existia —
+//     uma sala dele que ainda não morreu, por exemplo. Só o que é novo
+//     (o site) passa a impedir o app. Ver a regra de compatibilidade do
+//     servidor.
+function conflictingTransmission(req, { roomName, origin }) {
+  return liveTransmissionsOf(req).find((t) => {
+    if (origin === "web") return t.origin !== "web" || t.roomName !== roomName;
+    return t.origin === "web";
+  });
+}
+
+function liveElsewhereError(conflict) {
+  const where = conflict.origin === "web" ? "pelo Prisma Web" : "pelo app";
+  return {
+    error: `Você já está transmitindo ${where}. Encerre lá antes de transmitir aqui.`,
+    code: "live_elsewhere",
+    origin: conflict.origin,
+    roomName: conflict.roomName,
+  };
+}
+
+// O CRONÔMETRO DE CADA TRANSMISSÃO (2026-10-23) — o timer de cada tile na
+// aba de detalhes da sala, que até aqui só tinha o da sala inteira.
+//
+// Fora do `roomInternals` de propósito: a troca de fonte da tela pode
+// derrubar e recriar a sala (ver beginRoomIncarnation), e o registro dela
+// some junto. Aqui a marca sobrevive, e uma transmissão que volta dentro
+// da folga continua contando de onde estava — trocar de fonte não zera o
+// timer de quem assiste.
+const TRANSMISSION_RESUME_GRACE_MS = 60000;
+const transmissionClocks = new Map(); // `${roomName}:${kind}` -> { startedAt, stoppedAt }
+
+function touchTransmissionClock(roomName, kind, active) {
+  const now = Date.now();
+  for (const [key, clock] of transmissionClocks) {
+    if (clock.stoppedAt && now - clock.stoppedAt > TRANSMISSION_RESUME_GRACE_MS) {
+      transmissionClocks.delete(key);
+    }
+  }
+  const key = `${roomName}:${kind}`;
+  const clock = transmissionClocks.get(key);
+  if (active) {
+    transmissionClocks.set(key, { startedAt: clock?.startedAt ?? now, stoppedAt: null });
+  } else if (clock) {
+    transmissionClocks.set(key, { ...clock, stoppedAt: now });
+  }
+}
+
+// `{ screen, cam }` com o início (epoch ms) de cada transmissão no ar, ou
+// `null`. Nunca antes do início da SALA (o primeiro publisher, ver
+// markRoomReady): a transmissão é marcada no clique, 2-3s antes do
+// primeiro frame, e a que abriu a live tem que bater com o timer da sala.
+// Sem marca (restart do servidor no meio da live), cai no da sala.
+function roomSourcesStartedAt(room) {
+  const sources = roomSources(room.name);
+  const result = { screen: null, cam: null };
+  if (!room.startedAt) return result;
+  for (const kind of ["screen", "cam"]) {
+    if (!sources[kind]) continue;
+    const clock = transmissionClocks.get(`${room.name}:${kind}`);
+    result[kind] = Math.max(clock?.startedAt ?? room.startedAt, room.startedAt);
+  }
+  return result;
 }
 
 // UMA TRANSMISSÃO QUE SUMIU SEM AVISAR (2026-10-20).
@@ -748,8 +891,20 @@ function gameFromMetadata(room) {
 // Calculado aqui, e não guardado no `roomsState`, porque o webhook
 // reescreve a sala campo a campo e um campo a mais lá é um campo que
 // algum desses lugares esquece.
+//
+// `sourcesStartedAt` (2026-10-23): o início de cada uma, pro timer por
+// transmissão — ver roomSourcesStartedAt. Campo novo, app antigo ignora.
+//
+// `origins` (2026-10-28): de onde vem cada uma, "app" ou "web" — ver
+// roomOrigins. É o que deixa o app e o site avisarem "você já está
+// transmitindo pelo outro". Campo novo, app antigo ignora.
 function toPublicRoom(room) {
-  return { ...room, sources: roomSources(room.name) };
+  return {
+    ...room,
+    sources: roomSources(room.name),
+    sourcesStartedAt: roomSourcesStartedAt(room),
+    origins: roomOrigins(room.name),
+  };
 }
 
 // SALA PRIVADA = O DONO E OS AMIGOS DELE (2026-10-21, etapa 5).
@@ -1047,19 +1202,26 @@ async function readRoomPresence(roomName) {
   );
   const publisherKinds = [...new Set(publishers.map((p) => transmissionKindOfIdentity(p.identity)))];
   const screenPublisher = publishers.find((p) => !isCamIdentity(p.identity));
+  // De onde vem cada uma (2026-10-28) — ver TRANSMISSION_ORIGINS.
+  const publisherOrigins = {};
+  for (const p of publishers) {
+    const origin = originOfParticipant(p);
+    if (origin) publisherOrigins[transmissionKindOfIdentity(p.identity)] = origin;
+  }
   return {
     participants: visibleParticipants
       .filter((p) => !isCamIdentity(p.identity))
       .map((p) => p.identity),
     hostName: hostUsernameFromIdentity((screenPublisher ?? publishers[0])?.identity),
     publisherKinds,
+    publisherOrigins,
   };
 }
 
 // Passa a conhecer uma sala que já existe no LiveKit, mas que não está no
 // `roomsState`. Usado no boot e, desde 2026-10-16, também pela
 // reconciliação (ver `reconcileRooms`).
-function adoptExistingRoom(r, { hostName, participants, publisherKinds = [] }) {
+function adoptExistingRoom(r, { hostName, participants, publisherKinds = [], publisherOrigins = {} }) {
   roomsState.set(r.name, {
     name: r.name,
     hostName,
@@ -1094,6 +1256,7 @@ function adoptExistingRoom(r, { hostName, participants, publisherKinds = [] }) {
   for (const kind of publisherKinds) {
     setPublisherPresent(r.name, kind, true);
     setRoomTransmission(r.name, kind, true);
+    if (publisherOrigins[kind]) setTransmissionOrigin(r.name, kind, publisherOrigins[kind]);
   }
   // Sala com publisher lá dentro é uma live que JÁ está no ar — ela
   // ficou pronta numa execução anterior deste processo, e o `ready`
@@ -2900,6 +3063,163 @@ app.delete("/rooms/:roomName", requireAuth, async (req, res) => {
   }
 });
 
+// O QUE TODA TRANSMISSÃO PRECISA ANTES DE PUBLICAR (2026-10-28).
+//
+// Era o começo do POST /ingress. Saiu pra cá quando o Prisma Web passou
+// a transmitir (item 27 do Electron): ele não cria ingress — publica
+// direto do navegador —, mas a sala tem que nascer EXATAMENTE como nasce
+// pro app (dono, privacidade, jogo, allow-list, metadata, na mesma
+// ordem). Duas cópias disto é como a do site ficaria pra trás, e o
+// sintoma seria uma live do site nascendo pública, ou sem dono.
+//
+// Não muda nada pro app: o /ingress chama isto com os mesmos valores que
+// usava antes, na mesma ordem.
+async function openTransmission(req, { roomName, ownerName, isPrivate, game, kind, attaching }) {
+  // ⚠️ A ORDEM DESTE BLOCO IMPORTA (2026-09-29).
+  //
+  // Antes desta data a sala só passava a existir quando o GStreamer
+  // começava a publicar de verdade, segundos depois desta rota
+  // responder — havia tempo de sobra pra gravar o resto. Agora é o
+  // `ensureRoom` logo abaixo que cria a sala, e o webhook
+  // `room_started` volta quase junto com ele: gravar a privacidade ou
+  // a permissão do dono DEPOIS disso seria gravar tarde demais — uma
+  // live privada nasceria pública, e o dono não veria a própria sala
+  // no primeiro broadcast.
+  //
+  // Por isso tudo que o `room_started` consulta vem primeiro, e a
+  // criação da sala é o último passo antes do ingress.
+
+  let gameChanged = false;
+  if (!attaching) {
+    // Checkbox "Transmissão privada" da tela de iniciar live
+    // (2026-09-10, substituiu a senha de sala). Fica pendente até o
+    // "room_started" chegar e transferir pro roomsState — a sala em si
+    // ainda não existe neste ponto.
+    if (isPrivate) {
+      pendingRoomPrivate.set(roomName, true);
+    } else {
+      pendingRoomPrivate.delete(roomName);
+    }
+
+    // Idem pro jogo/janela. O `delete` no ramo vazio importa tanto
+    // quanto o `set`: o código de sala tem 6 dígitos e é reaproveitado,
+    // então um pendente órfão de uma live anterior viraria o "jogo" desta.
+    if (game) {
+      pendingRoomGame.set(roomName, game);
+    } else {
+      pendingRoomGame.delete(roomName);
+    }
+  } else if (kind === "screen" && game) {
+    // VINCULANDO À SALA QUE JÁ EXISTE: a privacidade é a da sala (o
+    // `private` daqui é ignorado — no app o seletor aparece travado).
+    // O jogo, não: uma sala aberta pela webcam não tem jogo nenhum, e
+    // a tela chegando é justamente quem traz um. A webcam nunca mexe
+    // no jogo.
+    const room = roomsState.get(roomName);
+    if (room) {
+      if (!sameGameReport(room.game, game)) {
+        roomsState.set(roomName, { ...room, game });
+        syncRoomMetadata(roomName);
+        gameChanged = true;
+      }
+    } else {
+      pendingRoomGame.set(roomName, game);
+    }
+  }
+
+  // BUG REAL corrigido em 2026-09-13: o HOST nunca entrava na
+  // allow-list da própria sala. O comentário do GET /token já dizia
+  // que a lista contém "o host e quem aceitou um convite", mas
+  // ninguém nunca o colocava lá — o /token não percebia porque pula a
+  // checagem inteira quando `role === "host"`.
+  //
+  // Quem percebia era o `canSeeRoom`, que NÃO tem essa exceção: numa
+  // live privada ele respondia "não pode ver" pro próprio dono. Com
+  // isso a sala do host sumia do broadcast pra ele mesmo, e no app
+  // `rooms.find(r => r.name === roomCode)` vinha `undefined` — daí o
+  // timer da live parado (sem `startedAt`), a lista de espectadores
+  // vazia e a sobreposição sem ninguém.
+  //
+  // Aqui é o único ponto do fluxo que sabe QUEM é o host (`req.userId`,
+  // autenticado): o webhook `room_started` recebe só o nome da sala.
+  // Incondicional, e não só quando `isPrivate`: "o dono pode ver a
+  // própria sala" vale sempre, e numa sala pública o `canSeeRoom` nem
+  // consulta a lista.
+  presence.allowInRoom(roomName, req.userId);
+
+  // Quem é o DONO desta live (2026-09-29). Mesmo motivo da linha
+  // acima: este é o único ponto do fluxo que sabe o `req.userId` do
+  // host. É o que as rotas DELETE conferem pra recusar alguém
+  // encerrando a transmissão dos outros — e o que continua valendo
+  // depois de o `hostName` zerar numa troca de fonte.
+  setRoomOwner(roomName, req.userId, ownerName);
+
+  // A SALA EM SI. Ver o comentário do `ensureRoom` pro porquê de este
+  // servidor ter passado a criar a sala em vez de deixar o
+  // `auto_create` do LiveKit fazer isso sozinho no primeiro cliente
+  // que conectar.
+  //
+  // O metadata já vai preenchido aqui, e não só no `syncRoomMetadata`
+  // depois, porque o `private` precisa estar gravado na sala desde o
+  // primeiro instante: é ele que sobrevive a um restart deste
+  // processo, e entre criar a sala e o primeiro sync existe uma janela
+  // em que uma live privada voltaria como pública.
+  //
+  // Vinculando, a sala já existe e o `createRoom` a devolve como está;
+  // o metadata vai mesmo assim, pelo mesmo motivo do /reconnecting: se
+  // ela tiver acabado de ser recolhida, renasce sabendo o que era.
+  let roomMetadata = isPrivate ? JSON.stringify({ private: true }) : undefined;
+  if (attaching) {
+    const known = roomMetadataPayload(roomsState.get(roomName));
+    roomMetadata = Object.keys(known).length > 0 ? JSON.stringify(known) : undefined;
+  }
+  await ensureRoom(roomName, roomMetadata);
+
+  return { gameChanged };
+}
+
+// A sala passa a anunciar esta transmissão desde já, antes do primeiro
+// frame — mesmo espírito do "start instantâneo". Numa sala que ainda vai
+// nascer, quem anuncia é o `room_started`.
+function announceTransmission(roomName, kind, origin, gameChanged) {
+  const sourcesChanged = setRoomTransmission(roomName, kind, true);
+  const originChanged = setTransmissionOrigin(roomName, kind, origin);
+  cancelTransmissionGone(roomName, kind);
+  if ((sourcesChanged || originChanged || gameChanged) && roomsState.has(roomName)) {
+    broadcastRooms();
+  }
+}
+
+// Uma transmissão que falhou ao abrir (era o `catch` do POST /ingress,
+// extraído junto com o openTransmission).
+function abandonTransmission(roomName, kind, attaching) {
+  // Vinculando, a sala continua de pé com a outra transmissão — só
+  // esta sai do anúncio.
+  if (attaching && setRoomTransmission(roomName, kind, false) && roomsState.has(roomName)) {
+    broadcastRooms();
+  }
+  // Não deixa rastro de uma live que não chegou a existir (2026-09-29).
+  //
+  // O código de sala tem 6 dígitos e é reaproveitado. Um dono ou uma
+  // marca de "privada" órfãos aqui passariam pra PRÓXIMA live que
+  // calhasse do mesmo código — e se fosse de outra pessoa, ela levaria
+  // 403 ao tentar encerrar a própria transmissão, sem saída nenhuma
+  // pela interface.
+  //
+  // Só quando a sala não chegou a nascer: se o `ensureRoom` passou e
+  // quem falhou foi o ingress, a sala existe e quem limpa é o
+  // `cleanupFinishedRoom` quando o LiveKit a recolher.
+  //
+  // E nunca vinculando (2026-10-20): aí o dono e a privacidade são da
+  // OUTRA transmissão, que pode estar justamente esperando o
+  // `room_started` com eles.
+  if (!attaching && !roomsState.has(roomName)) {
+    pendingRoomPrivate.delete(roomName);
+    pendingRoomGame.delete(roomName);
+    roomInternals.delete(roomName);
+  }
+}
+
 // POST /ingress { roomName, participantName } — cria um endpoint WHIP pro
 // host publicar via GStreamer usando o encoder de hardware da GPU, em vez
 // do encode por software/limitado do getDisplayMedia do Chromium. Devolve
@@ -2949,106 +3269,27 @@ app.post("/ingress", requireAuth, async (req, res) => {
     return res.status(403).json({ error: "Esta sala é de outra pessoa." });
   }
 
+  // UMA LIVE POR PESSOA (2026-10-28) — aqui só barra o que vem do site;
+  // ver conflictingTransmission pro porquê de o app não ser barrado por
+  // mais nada. O app 1.6 mostra o `error` desta resposta como está.
+  const conflict = conflictingTransmission(req, { roomName, origin: "app" });
+  if (conflict) {
+    console.warn(
+      `[ingress] ${req.username} pediu "${kind}" na sala ${roomName}, mas já transmite ` +
+        `"${conflict.kind}" pelo site na sala ${conflict.roomName} — recusado`,
+    );
+    return res.status(409).json(liveElsewhereError(conflict));
+  }
+
   try {
-    // ⚠️ A ORDEM DESTE BLOCO IMPORTA (2026-09-29).
-    //
-    // Antes desta data a sala só passava a existir quando o GStreamer
-    // começava a publicar de verdade, segundos depois desta rota
-    // responder — havia tempo de sobra pra gravar o resto. Agora é o
-    // `ensureRoom` logo abaixo que cria a sala, e o webhook
-    // `room_started` volta quase junto com ele: gravar a privacidade ou
-    // a permissão do dono DEPOIS disso seria gravar tarde demais — uma
-    // live privada nasceria pública, e o dono não veria a própria sala
-    // no primeiro broadcast.
-    //
-    // Por isso tudo que o `room_started` consulta vem primeiro, e a
-    // criação da sala é o último passo antes do ingress.
-
-    let gameChanged = false;
-    if (!attaching) {
-      // Checkbox "Transmissão privada" da tela de iniciar live
-      // (2026-09-10, substituiu a senha de sala). Fica pendente até o
-      // "room_started" chegar e transferir pro roomsState — a sala em si
-      // ainda não existe neste ponto.
-      if (isPrivate) {
-        pendingRoomPrivate.set(roomName, true);
-      } else {
-        pendingRoomPrivate.delete(roomName);
-      }
-
-      // Idem pro jogo/janela. O `delete` no ramo vazio importa tanto
-      // quanto o `set`: o código de sala tem 6 dígitos e é reaproveitado,
-      // então um pendente órfão de uma live anterior viraria o "jogo" desta.
-      if (parsedGame.game) {
-        pendingRoomGame.set(roomName, parsedGame.game);
-      } else {
-        pendingRoomGame.delete(roomName);
-      }
-    } else if (kind === "screen" && parsedGame.game) {
-      // VINCULANDO À SALA QUE JÁ EXISTE: a privacidade é a da sala (o
-      // `private` daqui é ignorado — no app o seletor aparece travado).
-      // O jogo, não: uma sala aberta pela webcam não tem jogo nenhum, e
-      // a tela chegando é justamente quem traz um. A webcam nunca mexe
-      // no jogo.
-      const room = roomsState.get(roomName);
-      if (room) {
-        if (!sameGameReport(room.game, parsedGame.game)) {
-          roomsState.set(roomName, { ...room, game: parsedGame.game });
-          syncRoomMetadata(roomName);
-          gameChanged = true;
-        }
-      } else {
-        pendingRoomGame.set(roomName, parsedGame.game);
-      }
-    }
-
-    // BUG REAL corrigido em 2026-09-13: o HOST nunca entrava na
-    // allow-list da própria sala. O comentário do GET /token já dizia
-    // que a lista contém "o host e quem aceitou um convite", mas
-    // ninguém nunca o colocava lá — o /token não percebia porque pula a
-    // checagem inteira quando `role === "host"`.
-    //
-    // Quem percebia era o `canSeeRoom`, que NÃO tem essa exceção: numa
-    // live privada ele respondia "não pode ver" pro próprio dono. Com
-    // isso a sala do host sumia do broadcast pra ele mesmo, e no app
-    // `rooms.find(r => r.name === roomCode)` vinha `undefined` — daí o
-    // timer da live parado (sem `startedAt`), a lista de espectadores
-    // vazia e a sobreposição sem ninguém.
-    //
-    // Aqui é o único ponto do fluxo que sabe QUEM é o host (`req.userId`,
-    // autenticado): o webhook `room_started` recebe só o nome da sala.
-    // Incondicional, e não só quando `isPrivate`: "o dono pode ver a
-    // própria sala" vale sempre, e numa sala pública o `canSeeRoom` nem
-    // consulta a lista.
-    presence.allowInRoom(roomName, req.userId);
-
-    // Quem é o DONO desta live (2026-09-29). Mesmo motivo da linha
-    // acima: este é o único ponto do fluxo que sabe o `req.userId` do
-    // host. É o que as rotas DELETE conferem pra recusar alguém
-    // encerrando a transmissão dos outros — e o que continua valendo
-    // depois de o `hostName` zerar numa troca de fonte.
-    setRoomOwner(roomName, req.userId, participantName);
-
-    // A SALA EM SI. Ver o comentário do `ensureRoom` pro porquê de este
-    // servidor ter passado a criar a sala em vez de deixar o
-    // `auto_create` do LiveKit fazer isso sozinho no primeiro cliente
-    // que conectar.
-    //
-    // O metadata já vai preenchido aqui, e não só no `syncRoomMetadata`
-    // depois, porque o `private` precisa estar gravado na sala desde o
-    // primeiro instante: é ele que sobrevive a um restart deste
-    // processo, e entre criar a sala e o primeiro sync existe uma janela
-    // em que uma live privada voltaria como pública.
-    //
-    // Vinculando, a sala já existe e o `createRoom` a devolve como está;
-    // o metadata vai mesmo assim, pelo mesmo motivo do /reconnecting: se
-    // ela tiver acabado de ser recolhida, renasce sabendo o que era.
-    let roomMetadata = isPrivate ? JSON.stringify({ private: true }) : undefined;
-    if (attaching) {
-      const known = roomMetadataPayload(roomsState.get(roomName));
-      roomMetadata = Object.keys(known).length > 0 ? JSON.stringify(known) : undefined;
-    }
-    await ensureRoom(roomName, roomMetadata);
+    const { gameChanged } = await openTransmission(req, {
+      roomName,
+      ownerName: participantName,
+      isPrivate,
+      game: parsedGame.game,
+      kind,
+      attaching,
+    });
 
     // A MESMA transmissão pedindo de novo (um start que falhou e foi
     // tentado outra vez): o ingress anterior dela sai antes, senão
@@ -3071,12 +3312,7 @@ app.post("/ingress", requireAuth, async (req, res) => {
 
     ingressIdsByRoom.set(roomName, { ...ingressIds, [kind]: ingress.ingressId });
 
-    // A sala passa a anunciar esta transmissão desde já, antes do
-    // primeiro frame — mesmo espírito do "start instantâneo". Numa sala
-    // que ainda vai nascer, quem anuncia é o `room_started`.
-    const sourcesChanged = setRoomTransmission(roomName, kind, true);
-    cancelTransmissionGone(roomName, kind);
-    if ((sourcesChanged || gameChanged) && roomsState.has(roomName)) broadcastRooms();
+    announceTransmission(roomName, kind, "app", gameChanged);
 
     console.log(
       `[ingress] sala ${roomName}: transmissão "${kind}" criada` +
@@ -3086,31 +3322,7 @@ app.post("/ingress", requireAuth, async (req, res) => {
     res.json({ url: ingress.url, streamKey: ingress.streamKey });
   } catch (err) {
     console.error("Erro ao criar ingress:", err);
-    // Vinculando, a sala continua de pé com a outra transmissão — só
-    // esta sai do anúncio.
-    if (attaching && setRoomTransmission(roomName, kind, false) && roomsState.has(roomName)) {
-      broadcastRooms();
-    }
-    // Não deixa rastro de uma live que não chegou a existir (2026-09-29).
-    //
-    // O código de sala tem 6 dígitos e é reaproveitado. Um dono ou uma
-    // marca de "privada" órfãos aqui passariam pra PRÓXIMA live que
-    // calhasse do mesmo código — e se fosse de outra pessoa, ela levaria
-    // 403 ao tentar encerrar a própria transmissão, sem saída nenhuma
-    // pela interface.
-    //
-    // Só quando a sala não chegou a nascer: se o `ensureRoom` passou e
-    // quem falhou foi o ingress, a sala existe e quem limpa é o
-    // `cleanupFinishedRoom` quando o LiveKit a recolher.
-    //
-    // E nunca vinculando (2026-10-20): aí o dono e a privacidade são da
-    // OUTRA transmissão, que pode estar justamente esperando o
-    // `room_started` com eles.
-    if (!attaching && !roomsState.has(roomName)) {
-      pendingRoomPrivate.delete(roomName);
-      pendingRoomGame.delete(roomName);
-      roomInternals.delete(roomName);
-    }
+    abandonTransmission(roomName, kind, attaching);
     res.status(500).json({ error: "Não foi possível criar o ingress." });
   }
 });
@@ -3196,6 +3408,177 @@ app.delete("/ingress/:roomName", requireAuth, async (req, res) => {
     console.error(`[ingress] FALHA ao remover ingress ${ingressId} (sala ${roomName}):`, err);
     return res.status(500).json({ ok: false, error: "Não foi possível remover o ingress." });
   }
+});
+
+// --- TRANSMITIR PELO PRISMA WEB (2026-10-28, item 27 do Electron) -------
+//
+// O app publica por ingress: o servidor cria um endpoint WHIP e o
+// GStreamer manda o vídeo pra ele. O site publica DIRETO DO NAVEGADOR,
+// como participante comum da sala (o livekit-client que ele já usa pra
+// assistir também publica). Não existe ingress nenhum — o que existe é um
+// token com permissão de publicar.
+//
+// Fora isso, a dinâmica é a do app, de propósito:
+//
+//   POST   /rooms/:roomName/publish            ≈ POST /ingress
+//   DELETE /rooms/:roomName/publish?source=     ≈ DELETE /ingress/:roomName
+//   DELETE /rooms/:roomName                      (o mesmo, encerra a sala)
+//   POST   /rooms/:roomName/game                 (o mesmo)
+//   POST   /rooms/:roomName/reconnecting         (o mesmo)
+//
+// A sala nasce pelo mesmo `openTransmission` do /ingress (dono,
+// privacidade, jogo, metadata), e daí em diante quem cuida dela são os
+// mesmos webhooks: o navegador entrando com `canPublish` é um publisher
+// como o do ingress, com a mesma identity (o username; a webcam com
+// `-cam`). Por isso quem assiste não precisa mudar nada.
+//
+// Debaixo de /rooms e não num prefixo novo: o nginx e o proxy do vite do
+// site já encaminham /rooms, e um prefixo novo precisaria dos dois (o
+// /ingress, por exemplo, não está no proxy do site).
+//
+// Tudo aqui é ADITIVO: nenhuma rota que o app 1.6 chama mudou de
+// comportamento, fora a trava de uma live por pessoa no /ingress — e ela
+// só age quando existe uma live do site, que até hoje não existia.
+
+// O que cada transmissão pode publicar. O token do site é de publicar UMA
+// coisa: sem isto, o token da webcam publicaria uma tela (ou o contrário),
+// e a identity deixaria de dizer qual é qual pra quem assiste.
+const WEB_PUBLISH_SOURCES = {
+  screen: [TrackSource.SCREEN_SHARE, TrackSource.SCREEN_SHARE_AUDIO],
+  cam: [TrackSource.CAMERA],
+};
+
+// O código de sala é o do app (6 dígitos, gerado no cliente — ver
+// hostRoom.ts no Electron). Rota nova pode ser estrita desde o começo.
+const ROOM_CODE_PATTERN = /^[0-9]{6}$/;
+
+// POST /rooms/:roomName/publish { private, game, source } — abre uma
+// transmissão do site e devolve o token pra publicar nela.
+//
+// Diferenças pro /ingress, todas de propósito:
+//   - a identity é SEMPRE o username de quem está logado. O /ingress
+//     confia no `participantName` que o app manda; aqui não tem por quê.
+//   - o token não assina nada (`canSubscribe: false`): quem publica pelo
+//     site vê a própria tela pela trilha local, e assistir à própria live
+//     gastaria a banda de upload dele duas vezes.
+app.post("/rooms/:roomName/publish", requireAuth, async (req, res) => {
+  const roomName = req.params.roomName;
+  const { private: isPrivate, game, source } = req.body ?? {};
+
+  if (!ROOM_CODE_PATTERN.test(roomName)) {
+    return res.status(400).json({ error: "Código de sala inválido." });
+  }
+
+  const parsedGame = parseGameReport(game);
+  if (parsedGame.error) {
+    return res.status(parsedGame.status).json({ error: parsedGame.error });
+  }
+
+  const kind = parseTransmissionKind(source);
+
+  // Mesma regra do /ingress pra saber se é a segunda transmissão.
+  const attaching =
+    roomsState.has(roomName) || roomInternals.get(roomName)?.ownerUserId != null;
+
+  if (attaching && roomOwnerCheck(roomName, req) === false) {
+    console.warn(
+      `[publish] ${req.username} tentou vincular "${kind}" à sala ${roomName}, que não é dele — recusado`,
+    );
+    return res.status(403).json({ error: "Esta sala é de outra pessoa." });
+  }
+
+  const conflict = conflictingTransmission(req, { roomName, origin: "web" });
+  if (conflict) {
+    console.warn(
+      `[publish] ${req.username} pediu "${kind}" na sala ${roomName}, mas já transmite ` +
+        `"${conflict.kind}" (${conflict.origin ?? "origem desconhecida"}) na sala ` +
+        `${conflict.roomName} — recusado`,
+    );
+    return res.status(409).json(liveElsewhereError(conflict));
+  }
+
+  try {
+    const { gameChanged } = await openTransmission(req, {
+      roomName,
+      ownerName: req.username,
+      isPrivate,
+      game: parsedGame.game,
+      kind,
+      attaching,
+    });
+
+    const identity = kind === "cam" ? camIdentityFor(req.username) : req.username;
+    const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
+      identity,
+      name: req.username,
+      ttl: LIVEKIT_TOKEN_TTL,
+    });
+    at.addGrant({
+      room: roomName,
+      roomJoin: true,
+      canPublish: true,
+      canPublishSources: WEB_PUBLISH_SOURCES[kind],
+      canPublishData: false,
+      canSubscribe: false,
+    });
+    const token = await at.toJwt();
+
+    announceTransmission(roomName, kind, "web", gameChanged);
+
+    console.log(
+      `[publish] sala ${roomName}: transmissão "${kind}" do site aberta por ${req.username}` +
+        (attaching ? " (vinculada à sala que já existia)" : ""),
+    );
+
+    res.json({ token, identity });
+  } catch (err) {
+    console.error(`[publish] erro ao abrir "${kind}" na sala ${roomName}:`, err);
+    abandonTransmission(roomName, kind, attaching);
+    res.status(500).json({ error: "Não foi possível iniciar a transmissão." });
+  }
+});
+
+// DELETE /rooms/:roomName/publish?source=screen|cam — para UMA transmissão
+// do site e deixa a outra no ar. O site chama isto antes de desconectar,
+// como o app chama o DELETE /ingress antes de matar o GStreamer; quando é
+// a última, chama o DELETE /rooms/:roomName em seguida, igual o app.
+//
+// Idempotente pelo mesmo motivo do DELETE /ingress: quem está parando quer
+// que não haja mais transmissão, e já não haver é sucesso.
+app.delete("/rooms/:roomName/publish", requireAuth, async (req, res) => {
+  const roomName = req.params.roomName;
+
+  const isOwner = roomOwnerCheck(roomName, req);
+  if (isOwner === false) {
+    console.warn(
+      `[publish] ${req.username} tentou parar uma transmissão da sala ${roomName}, ` +
+        "que não é dele — recusado",
+    );
+    return res
+      .status(403)
+      .json({ ok: false, error: "Só quem iniciou a transmissão pode encerrá-la." });
+  }
+
+  const kind = parseTransmissionKind(req.query?.source);
+
+  cancelTransmissionGone(roomName, kind);
+  if (setRoomTransmission(roomName, kind, false) && roomsState.has(roomName)) {
+    broadcastRooms();
+  }
+
+  // E tira o publisher da sala, se ele ainda estiver lá. No caminho normal
+  // o próprio navegador já desconectou; isto cobre a aba que travou, ou
+  // OUTRA aba publicando com a mesma identity. "Não está na sala" é o
+  // objetivo, então não é erro.
+  const identity = kind === "cam" ? camIdentityFor(req.username) : req.username;
+  try {
+    await roomService.removeParticipant(roomName, identity);
+  } catch {
+    // Já tinha saído (ou a sala nem existe mais) — nada a fazer.
+  }
+
+  console.log(`[publish] sala ${roomName}: transmissão "${kind}" do site parada por ${req.username}`);
+  res.json({ ok: true });
 });
 
 // GET /rooms — snapshot sob demanda da mesma lista que o WebSocket
@@ -3983,6 +4366,15 @@ app.post("/webhook", async (req, res) => {
           setPublisherPresent(event.room.name, kind, true);
           cancelTransmissionGone(event.room.name, kind);
           setRoomTransmission(event.room.name, kind, true);
+          // De onde ela vem, pelo LiveKit (2026-10-28) — ver
+          // TRANSMISSION_ORIGINS. Só preenche o que ninguém gravou: o
+          // pedido (/ingress ou /publish) sabe com certeza, e o `kind` do
+          // participante vale 0 ("STANDARD", ou seja "web") quando vem
+          // vazio — confiar nele por cima do pedido faria o app ser
+          // barrado pela própria live. O broadcast logo abaixo leva junto.
+          if (!roomInternals.get(event.room.name)?.origins?.[kind]) {
+            setTransmissionOrigin(event.room.name, kind, originOfParticipant(event.participant));
+          }
         } else if (publisherLeft) {
           setPublisherPresent(event.room.name, kind, false);
           scheduleTransmissionGone(event.room.name, kind);

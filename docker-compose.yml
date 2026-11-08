@@ -227,7 +227,7 @@ services:
     # requisição. Explicação completa no topo de auth/rateLimit.js.
     #
     # ⚠️ Consequência pra quem já tinha o app instalado: instalações
-    # feitas ANTES de 2026-09-10 apontam pra http://143.20.0.54:5000 e
+    # feitas ANTES de 2026-09-10 apontam pra http://<IP-da-VM>:5000 e
     # param de funcionar aqui. O instalador novo apaga o config.json
     # antigo (seção [InstallDelete] do prisma.iss), então a primeira
     # atualização conserta a máquina — mas quem estiver numa build velha

@@ -1,6 +1,7 @@
 {
   "name": "prisma_server",
   "version": "1.2.0",
+  "license": "MIT",
   "description": "Servidor de autenticação e API para o app Prisma",
   "main": "server.js",
   "scripts": {

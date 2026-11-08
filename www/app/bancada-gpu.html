@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bancada GPU</title>
+<!--
+  Etapa 0 do item 27 do ROADMAP (transmitir pelo Prisma Web).
+
+  Página de TESTE, solta do app: não fala com o servidor nem com o
+  LiveKit. Faz um loopback WebRTC local (dois RTCPeerConnection na mesma
+  página), que passa pelo MESMO encoder que o livekit-client vai usar —
+  então o que aparece aqui é o que a transmissão de verdade vai ter.
+
+  Responde três perguntas antes de escrever a transmissão:
+    1. O `mediaCapabilities.encodingInfo` diz a verdade sobre a GPU?
+    2. O `getStats()` expõe `powerEfficientEncoder`/`encoderImplementation`
+       só com a captura de TELA, ou o Chrome esconde sem câmera/mic?
+    3. Quando cai pro software (OpenH264), a checagem pega?
+
+  Fica no projeto depois da etapa 0 (decisão do usuário, 2026-10-28), pra
+  testar outras máquinas e versões novas do navegador.
+-->
+<style>
+  :root { --bg:#0f1115; --card:#181b22; --line:#2a2f3a; --fg:#e6e8ee; --dim:#8a90a0;
+          --ok:#3ecf8e; --bad:#ff5d5d; --warn:#f5b942; --acc:#7c6cff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, sans-serif; }
+  main { max-width:1100px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  h2 { font-size:15px; margin:0 0 12px; }
+  p.sub { color:var(--dim); margin:0 0 20px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
+  button, select { background:#232733; color:var(--fg); border:1px solid var(--line); border-radius:6px;
+                   padding:7px 12px; font:inherit; cursor:pointer; }
+  button:hover { border-color:var(--acc); }
+  button.primary { background:var(--acc); border-color:var(--acc); }
+  button:disabled { opacity:.45; cursor:default; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:10px; }
+  .wrap { overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--dim); font-weight:500; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); } .warn { color:var(--warn); } .dim { color:var(--dim); }
+  code { background:#232733; padding:1px 5px; border-radius:4px; font-size:12px; }
+  #log { font:12px/1.5 ui-monospace, Consolas, monospace; max-height:220px; overflow:auto; white-space:pre-wrap; margin:0; }
+  video { width:100%; max-width:360px; border-radius:6px; background:#000; }
+  .verdict { font-size:16px; font-weight:600; }
+  ul { margin:6px 0 0; padding-left:20px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Bancada GPU</h1>
+  <p class="sub">Etapa 0 do item 27: conferir se o navegador codifica H.264 na GPU antes de deixar transmitir pelo Prisma Web.</p>
+
+  <section>
+    <h2>Máquina</h2>
+    <div id="machine" class="dim">lendo…</div>
+  </section>
+
+  <section>
+    <h2>1. O que o navegador promete (<code>encodingInfo</code>)</h2>
+    <div class="wrap"><table id="caps"><thead><tr>
+      <th>Codec</th><th>Resolução</th><th>Suportado</th><th>Fluido</th><th>GPU (powerEfficient)</th>
+    </tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <section>
+    <h2>2. O que acontece de verdade (<code>getStats</code>)</h2>
+    <div class="row">
+      <label>Perfil H.264 <select id="profile"></select></label>
+      <label>contentHint <select id="hint">
+        <option value="motion">motion (jogo)</option>
+        <option value="detail">detail (texto)</option>
+        <option value="">(nenhum)</option>
+      </select></label>
+      <label>FPS <select id="fps"><option>60</option><option>30</option></select></label>
+    </div>
+    <div class="row">
+      <button class="primary" id="btnScreen">Capturar tela</button>
+      <button id="btnCam">Capturar webcam</button>
+      <button id="btnMic" title="Pra ver se o Chrome só mostra o encoder com permissão de câmera/mic">Liberar microfone (teste de exposição)</button>
+      <button id="btnExtra" disabled title="Abre mais um encoder com a mesma fonte — testa o limite de sessões da GPU">+1 encoder</button>
+      <button id="btnStop" disabled>Parar tudo</button>
+    </div>
+    <div id="verdict" class="verdict dim">Nenhuma captura ainda.</div>
+    <div class="wrap" style="margin-top:10px"><table id="sessions"><thead><tr>
+      <th>#</th><th>Fonte</th><th>Codec</th><th>Encoder</th><th>GPU</th><th>Res.</th><th>FPS</th>
+      <th>kbps</th><th>ms/quadro</th><th>Limitado por</th><th>Decoder</th><th>GPU / software</th>
+    </tr></thead><tbody></tbody></table></div>
+    <div class="row" style="margin-top:12px"><video id="preview" autoplay muted playsinline></video></div>
+  </section>
+
+  <section>
+    <h2>3. Eventos</h2>
+    <pre id="log"></pre>
+  </section>
+
+  <section>
+    <h2>Relatório</h2>
+    <div class="row">
+      <button id="btnCopy">Copiar relatório (JSON)</button>
+      <span id="copied" class="dim"></span>
+    </div>
+    <div class="dim">
+      Pra forçar o software e ver se a checagem pega, feche o Chrome e abra assim (perfil separado, não mexe no seu):
+      <ul>
+        <li><code>chrome.exe --user-data-dir=%TEMP%\chrome-sw --disable-accelerated-video-encode</code></li>
+        <li>No Edge, o mesmo com <code>msedge.exe</code>.</li>
+      </ul>
+      Pra ver o limite de sessões da GPU, capture a tela e vá clicando <b>+1 encoder</b> até alguma linha virar software.
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const report = { machine: {}, caps: [], sessions: [], finished: [], events: [] };
+
+function log(msg, cls) {
+  const t = new Date().toLocaleTimeString('pt-BR');
+  report.events.push(`${t} ${msg}`);
+  const line = document.createElement('div');
+  line.textContent = `${t}  ${msg}`;
+  if (cls) line.className = cls;
+  $('log').appendChild(line);
+  $('log').scrollTop = $('log').scrollHeight;
+}
+
+// ---------- Máquina ----------
+async function readMachine() {
+  const m = report.machine;
+  m.userAgent = navigator.userAgent;
+  try {
+    const gl = document.createElement('canvas').getContext('webgl');
+    const ext = gl && gl.getExtension('WEBGL_debug_renderer_info');
+    m.gpu = ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : '(escondido)';
+  } catch { m.gpu = '(erro lendo)'; }
+  try {
+    if (navigator.userAgentData) {
+      const h = await navigator.userAgentData.getHighEntropyValues(['platformVersion', 'fullVersionList']);
+      m.browser = (h.fullVersionList || []).filter(b => !/Not.?A.?Brand|Chromium/i.test(b.brand))
+        .map(b => `${b.brand} ${b.version}`).join(', ');
+      m.platform = `${navigator.userAgentData.platform} ${h.platformVersion}`;
+    }
+  } catch {}
+  $('machine').innerHTML =
+    `<div><b>GPU:</b> ${m.gpu}</div><div><b>Navegador:</b> ${m.browser || m.userAgent}</div>` +
+    (m.platform ? `<div><b>Sistema:</b> ${m.platform}</div>` : '');
+}
+
+// ---------- 1. encodingInfo ----------
+const RES = [[1280, 720, 30], [1920, 1080, 30], [1920, 1080, 60], [2560, 1440, 60]];
+const CODECS = ['video/H264', 'video/VP8', 'video/VP9', 'video/AV1'];
+const yes = (v) => v ? '<span class="ok">sim</span>' : '<span class="bad">não</span>';
+
+async function readCaps() {
+  const tb = $('caps').tBodies[0];
+  if (!navigator.mediaCapabilities) {
+    tb.innerHTML = '<tr><td colspan="5" class="bad">Este navegador não tem mediaCapabilities.</td></tr>';
+    return;
+  }
+  for (const contentType of CODECS) {
+    for (const [width, height, framerate] of RES) {
+      let r;
+      try {
+        r = await navigator.mediaCapabilities.encodingInfo({
+          type: 'webrtc',
+          video: { contentType, width, height, framerate, bitrate: 8_000_000 }
+        });
+      } catch (e) { r = { error: String(e) }; }
+      report.caps.push({ contentType, width, height, framerate, ...r });
+      const tr = tb.insertRow();
+      tr.innerHTML = r.error
+        ? `<td>${contentType}</td><td>${width}x${height}@${framerate}</td><td colspan="3" class="bad">${r.error}</td>`
+        : `<td>${contentType}</td><td>${width}x${height}@${framerate}</td>` +
+          `<td>${yes(r.supported)}</td><td>${yes(r.smooth)}</td><td>${yes(r.powerEfficient)}</td>`;
+    }
+  }
+}
+
+// ---------- Perfis H.264 que o navegador oferece ----------
+function h264Codecs() {
+  return (RTCRtpSender.getCapabilities('video')?.codecs || [])
+    .filter(c => /h264/i.test(c.mimeType) && /packetization-mode=1/.test(c.sdpFmtpLine || ''));
+}
+function fillProfiles() {
+  const names = { '42e0': 'Constrained Baseline', '4200': 'Baseline', '4d00': 'Main', '6400': 'High', '640c': 'Constrained High', 'f400': 'High 4:4:4' };
+  const seen = new Set();
+  for (const c of h264Codecs()) {
+    const id = (c.sdpFmtpLine.match(/profile-level-id=([0-9a-f]{6})/i) || [])[1];
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const opt = document.createElement('option');
+    opt.value = id;
+    opt.textContent = `${names[id.slice(0, 4).toLowerCase()] || 'perfil'} (${id})`;
+    $('profile').appendChild(opt);
+  }
+  if (!seen.size) $('profile').innerHTML = '<option value="">(sem H.264!)</option>';
+  // High por padrão: na primeira rodada (AMD) o Baseline caiu pro software.
+  const high = [...$('profile').options].find(o => /^64/i.test(o.value));
+  if (high) $('profile').value = high.value;
+}
+
+// ---------- 2. Loopback ----------
+let sources = [];   // MediaStreamTrack originais (tela/webcam)
+let sessions = [];  // { n, label, tx, rx, sender, last, wasGpu }
+let micStream = null;
+let timer = null;
+
+async function newSession(track, label) {
+  const n = sessions.length + 1;
+  const tx = new RTCPeerConnection();
+  const rx = new RTCPeerConnection();
+  tx.onicecandidate = (e) => e.candidate && rx.addIceCandidate(e.candidate);
+  rx.onicecandidate = (e) => e.candidate && tx.addIceCandidate(e.candidate);
+  if (n === 1) rx.ontrack = (e) => { $('preview').srcObject = new MediaStream([e.track]); };
+
+  const tc = tx.addTransceiver(track, { direction: 'sendonly' });
+  // Só o perfil H.264 escolhido (mais rtx/red/fec). Sem VP8 de reserva:
+  // se não negociar H.264, a gente QUER ver dar erro.
+  const pid = $('profile').value.toLowerCase();
+  const all = RTCRtpSender.getCapabilities('video').codecs;
+  const chosen = h264Codecs().filter(c => !pid || (c.sdpFmtpLine || '').toLowerCase().includes(`profile-level-id=${pid}`));
+  const extras = all.filter(c => /rtx|red|ulpfec|flexfec/i.test(c.mimeType));
+  tc.setCodecPreferences([...chosen, ...extras]);
+
+  const p = tc.sender.getParameters();
+  p.encodings = p.encodings?.length ? p.encodings : [{}];
+  p.encodings[0].maxBitrate = 8_000_000;
+  p.encodings[0].maxFramerate = Number($('fps').value);
+  p.degradationPreference = 'maintain-framerate';
+
+  const offer = await tx.createOffer();
+  await tx.setLocalDescription(offer);
+  await rx.setRemoteDescription(offer);
+  const answer = await rx.createAnswer();
+  await rx.setLocalDescription(answer);
+  await tx.setRemoteDescription(answer);
+  try { await tc.sender.setParameters(p); } catch (e) { log(`#${n} setParameters falhou: ${e.message}`, 'warn'); }
+
+  const s = { n, label, profile: pid, tx, rx, sender: tc.sender, last: null, wasGpu: null, stats: {}, gpuSec: 0, swSec: 0, drops: 0 };
+  sessions.push(s);
+  $('sessions').tBodies[0].insertRow().id = `s${n}`;
+  log(`#${n} encoder aberto (${label}, perfil ${pid || 'qualquer'}).`);
+  if (!timer) timer = setInterval(poll, 1000);
+  $('btnExtra').disabled = false;
+  $('btnStop').disabled = false;
+}
+
+async function poll() {
+  for (const s of sessions) {
+    const st = await s.tx.getStats();
+    let out, codec;
+    st.forEach(r => { if (r.type === 'outbound-rtp' && r.kind === 'video') out = r; });
+    if (!out) continue;
+    codec = out.codecId && st.get(out.codecId);
+    let inb;
+    (await s.rx.getStats()).forEach(r => { if (r.type === 'inbound-rtp' && r.kind === 'video') inb = r; });
+
+    const kbps = s.last ? Math.round((out.bytesSent - s.last.bytesSent) * 8 / ((out.timestamp - s.last.timestamp))) : 0;
+    const msPerFrame = out.framesEncoded ? (out.totalEncodeTime / out.framesEncoded * 1000).toFixed(1) : '-';
+    s.last = out;
+
+    const gpu = out.powerEfficientEncoder; // true | false | undefined (escondido)
+    if (gpu === true) s.gpuSec++;
+    if (gpu === false) s.swSec++;
+    s.stats = {
+      profile: s.profile, gpuSec: s.gpuSec, swSec: s.swSec, drops: s.drops,
+      codec: codec ? `${codec.mimeType} ${codec.sdpFmtpLine || ''}`.trim() : null,
+      encoderImplementation: out.encoderImplementation, powerEfficientEncoder: gpu,
+      frameWidth: out.frameWidth, frameHeight: out.frameHeight, framesPerSecond: out.framesPerSecond,
+      kbps, msPerFrame, qualityLimitationReason: out.qualityLimitationReason,
+      decoderImplementation: inb?.decoderImplementation, powerEfficientDecoder: inb?.powerEfficientDecoder
+    };
+
+    if (gpu !== undefined && gpu !== s.wasGpu) {
+      if (s.wasGpu === true && gpu === false) {
+        s.drops++;
+        log(`#${s.n} CAIU PRO SOFTWARE (${out.encoderImplementation}). Na transmissão de verdade, aqui apareceria o aviso.`, 'bad');
+      }
+      else log(`#${s.n} encoder: ${out.encoderImplementation} (${gpu ? 'GPU' : 'software'}).`, gpu ? 'ok' : 'bad');
+      s.wasGpu = gpu;
+    }
+
+    const gpuCell = gpu === true ? '<span class="ok">sim</span>' : gpu === false ? '<span class="bad">NÃO</span>' : '<span class="warn">escondido</span>';
+    $(`s${s.n}`).innerHTML =
+      `<td>${s.n}</td><td>${s.label}</td><td>${codec ? codec.mimeType.replace('video/', '') + ' ' + ((codec.sdpFmtpLine || '').match(/profile-level-id=(\w+)/) || [, ''])[1] : '-'}</td>` +
+      `<td>${out.encoderImplementation ?? '<span class="warn">escondido</span>'}</td><td>${gpuCell}</td>` +
+      `<td>${out.frameWidth ?? '-'}x${out.frameHeight ?? '-'}</td><td>${out.framesPerSecond ?? '-'}</td>` +
+      `<td>${kbps}</td><td>${msPerFrame}</td><td>${out.qualityLimitationReason ?? '-'}</td>` +
+      `<td>${inb?.decoderImplementation ?? '-'}</td>` +
+      `<td><span class="ok">${s.gpuSec}s</span> / <span class="${s.swSec ? 'bad' : 'dim'}">${s.swSec}s</span> (${s.drops} quedas)</td>`;
+  }
+  updateVerdict();
+}
+
+function updateVerdict() {
+  const v = $('verdict');
+  if (!sessions.length) { v.className = 'verdict dim'; v.textContent = 'Nenhuma captura ainda.'; return; }
+  const vals = sessions.map(s => s.stats.powerEfficientEncoder);
+  if (vals.some(x => x === undefined)) {
+    v.className = 'verdict warn';
+    v.textContent = 'O navegador está ESCONDENDO o encoder. Tente "Liberar microfone" e veja se aparece — isso decide como a etapa 2 vai checar a GPU.';
+  } else if (vals.every(x => x === true)) {
+    v.className = 'verdict ok';
+    v.textContent = 'Tudo na GPU.';
+  } else {
+    v.className = 'verdict bad';
+    v.textContent = 'Tem encoder em SOFTWARE. Na transmissão de verdade, aqui apareceria o aviso (e a live seguiria).';
+  }
+}
+
+async function capture(kind) {
+  try {
+    const fps = Number($('fps').value);
+    const stream = kind === 'screen'
+      ? await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: fps, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false })
+      : await navigator.mediaDevices.getUserMedia({ video: { frameRate: fps, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+    const track = stream.getVideoTracks()[0];
+    if ($('hint').value) track.contentHint = $('hint').value;
+    const set = track.getSettings();
+    const label = `${kind === 'screen' ? 'tela' : 'webcam'} ${set.width}x${set.height}@${Math.round(set.frameRate || 0)}`;
+    track.onended = () => log(`${label}: captura encerrada pelo navegador.`, 'warn');
+    sources.push({ track, label });
+    report.sessions.push({ label, settings: set, contentHint: track.contentHint });
+    await newSession(track, label);
+  } catch (e) {
+    log(`Captura (${kind}) falhou: ${e.message}`, 'bad');
+  }
+}
+
+$('btnScreen').onclick = () => capture('screen');
+$('btnCam').onclick = () => capture('cam');
+$('btnExtra').onclick = () => {
+  const src = sources[0];
+  if (src) newSession(src.track.clone(), `${src.label} (extra)`);
+};
+$('btnMic').onclick = async () => {
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    log('Microfone liberado (só pra teste de exposição; não é enviado).');
+  } catch (e) { log(`Microfone negado: ${e.message}`, 'warn'); }
+};
+$('btnStop').onclick = () => {
+  clearInterval(timer); timer = null;
+  // Guarda o resumo antes de fechar, senão o relatório sai sem o "live".
+  for (const s of sessions) report.finished.push({ n: s.n, label: s.label, ...s.stats });
+  for (const s of sessions) { s.tx.close(); s.rx.close(); }
+  for (const s of sources) s.track.stop();
+  micStream?.getTracks().forEach(t => t.stop());
+  sessions = []; sources = []; micStream = null;
+  $('sessions').tBodies[0].innerHTML = '';
+  $('preview').srcObject = null;
+  $('btnExtra').disabled = true; $('btnStop').disabled = true;
+  updateVerdict();
+  log('Tudo parado.');
+};
+$('btnCopy').onclick = async () => {
+  const out = { ...report, live: sessions.map(s => ({ n: s.n, label: s.label, ...s.stats })) };
+  try { await navigator.clipboard.writeText(JSON.stringify(out, null, 2)); $('copied').textContent = 'copiado!'; }
+  catch { $('copied').textContent = 'não deu pra copiar — veja o console'; console.log(out); }
+  setTimeout(() => $('copied').textContent = '', 2500);
+};
+
+readMachine();
+fillProfiles();
+readCaps();
+</script>
+</body>
+</html>

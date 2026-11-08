@@ -224,7 +224,7 @@ release não fica presa.
 Registro **A** para `admin`, apontando pro mesmo IP da VM:
 
 ```
-admin   A   143.20.0.54
+admin   A   SEU_IP_PUBLICO
 ```
 
 ### 2. Reorganizar o `www/`
